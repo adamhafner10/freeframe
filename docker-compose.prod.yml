@@ -118,7 +118,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: sh -c "celery -A apps.api.tasks.celery_app worker -Q transcoding -c $${TRANSCODING_CONCURRENCY:-2} --loglevel=warning"
+    command: sh -c "celery -A apps.api.tasks.celery_app worker -Q transcoding,default -c $${TRANSCODING_CONCURRENCY:-2} --loglevel=warning"
     healthcheck:
       disable: true
     restart: unless-stopped
