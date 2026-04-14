@@ -13,6 +13,7 @@ import {
   Trash,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { FolderTreeNode } from '@/types'
 
 interface FolderTreeProps {
@@ -55,6 +56,8 @@ function FolderNode({
   const [renaming, setRenaming] = useState(false)
   const [renameName, setRenameName] = useState(node.name)
   const [isDragOver, setIsDragOver] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const isActive = currentFolderId === node.id
 
   const hasChildren = node.children.length > 0
@@ -190,17 +193,29 @@ function FolderNode({
           <div className="my-1 border-t border-border" />
           <button
             className="flex w-full items-center gap-2 px-3 py-1.5 text-[12px] text-red-400 hover:bg-red-500/10"
-            onClick={async () => {
+            onClick={() => {
               setMenuOpen(false)
-              if (confirm(`Delete folder "${node.name}" and all its contents?`)) {
-                await onDeleteFolder(node.id)
-              }
+              setDeleteOpen(true)
             }}
           >
             <Trash className="h-3 w-3" /> Delete
           </button>
         </div>
       )}
+
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={`Delete "${node.name}"?`}
+        description="This removes the folder and everything inside it. You can't undo this."
+        confirmLabel="Delete folder"
+        variant="danger"
+        loading={deleting}
+        onConfirm={async () => {
+          setDeleting(true)
+          try { await onDeleteFolder(node.id) } finally { setDeleting(false) }
+        }}
+      />
 
       {/* Children */}
       {expanded && hasChildren && (

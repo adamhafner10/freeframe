@@ -8,6 +8,7 @@ import { cn, formatRelativeTime, formatBytes } from '@/lib/utils'
 import { getGradientForProject } from '@/lib/gradient-utils'
 import { api } from '@/lib/api'
 import { ProjectSettingsDialog } from './project-settings-dialog'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { Project } from '@/types'
 
 interface ProjectCardProps {
@@ -28,16 +29,14 @@ export function ProjectCard({
   const gradient = getGradientForProject(project.id)
   const assetCount = project.asset_count ?? 0
   const [settingsOpen, setSettingsOpen] = React.useState(false)
+  const [deleteOpen, setDeleteOpen] = React.useState(false)
   const [deleting, setDeleting] = React.useState(false)
 
   const handleDelete = async () => {
-    if (!confirm(`Delete "${project.name}"? This action cannot be undone.`)) return
     setDeleting(true)
     try {
       await api.delete(`/projects/${project.id}`)
       onMutate?.()
-    } catch {
-      // silently fail
     } finally {
       setDeleting(false)
     }
@@ -140,7 +139,7 @@ export function ProjectCard({
 
                 <DropdownMenu.Item
                   className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-status-error hover:bg-status-error/10 cursor-pointer outline-none transition-colors"
-                  onSelect={handleDelete}
+                  onSelect={() => setDeleteOpen(true)}
                   disabled={deleting}
                 >
                   <Trash2 className="h-4 w-4" />
@@ -158,6 +157,17 @@ export function ProjectCard({
         open={settingsOpen}
         onOpenChange={setSettingsOpen}
         onUpdated={() => onMutate?.()}
+      />
+
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={`Delete "${project.name}"?`}
+        description="This permanently removes the project and all assets inside it. This can't be undone."
+        confirmLabel="Delete project"
+        variant="danger"
+        loading={deleting}
+        onConfirm={handleDelete}
       />
     </>
   )

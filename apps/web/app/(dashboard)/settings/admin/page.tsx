@@ -166,6 +166,20 @@ function userStatusBadge(status: UserStatus) {
 export default function AdminPage() {
   const { user, isSuperAdmin } = useAuthStore();
   const router = useRouter();
+  const [banner, setBanner] = React.useState<string | null>(null);
+  const bannerTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showError = React.useCallback((msg: string) => {
+    setBanner(msg);
+    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+    bannerTimerRef.current = setTimeout(() => setBanner(null), 5000);
+  }, []);
+
+  React.useEffect(() => {
+    return () => {
+      if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+    };
+  }, []);
 
   const { data: usersResp, isLoading: loadingUsers } = useSWR<User[]>(
     isSuperAdmin ? "/admin/users" : null,
@@ -183,9 +197,7 @@ export default function AdminPage() {
       await api.patch(`/admin/users/${userId}/deactivate`);
       mutate("/admin/users");
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "Failed to deactivate user";
-      alert(message);
+      showError(err instanceof Error ? err.message : "Failed to deactivate user");
     }
   };
 
@@ -194,9 +206,7 @@ export default function AdminPage() {
       await api.patch(`/admin/users/${userId}/reactivate`);
       mutate("/admin/users");
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "Failed to reactivate user";
-      alert(message);
+      showError(err instanceof Error ? err.message : "Failed to reactivate user");
     }
   };
 
@@ -220,9 +230,7 @@ export default function AdminPage() {
       });
       mutate("/admin/users");
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "Failed to update user role";
-      alert(message);
+      showError(err instanceof Error ? err.message : "Failed to update user role");
     }
   };
 
@@ -232,6 +240,22 @@ export default function AdminPage() {
 
   return (
     <div className="p-6 space-y-8">
+      {banner && (
+        <div
+          role="alert"
+          className="flex items-start justify-between gap-3 rounded-lg border border-status-error/30 bg-status-error/10 px-4 py-3"
+        >
+          <p className="text-sm text-status-error">{banner}</p>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => setBanner(null)}
+            className="text-status-error/80 hover:text-status-error"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center gap-3">
         <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent-muted">
