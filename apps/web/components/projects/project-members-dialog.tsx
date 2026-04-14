@@ -7,6 +7,7 @@ import { X, ChevronDown, ArrowLeft, Users, Crown, Loader2, Check } from 'lucide-
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Avatar } from '@/components/shared/avatar'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 import type { ProjectRole, User } from '@/types'
@@ -309,6 +310,7 @@ function ManageView({
   onMembersChanged: () => void
 }) {
   const [removing, setRemoving] = React.useState<string | null>(null)
+  const [pendingRemove, setPendingRemove] = React.useState<MemberWithUser | null>(null)
 
   async function handleRoleChange(userId: string, newRole: ProjectRole) {
     try {
@@ -319,13 +321,12 @@ function ManageView({
     }
   }
 
-  async function handleRemove(userId: string) {
-    setRemoving(userId)
+  async function confirmRemove() {
+    if (!pendingRemove) return
+    setRemoving(pendingRemove.user_id)
     try {
-      await api.delete(`/projects/${projectId}/members/${userId}`)
+      await api.delete(`/projects/${projectId}/members/${pendingRemove.user_id}`)
       onMembersChanged()
-    } catch {
-      // silently ignore
     } finally {
       setRemoving(null)
     }
@@ -390,7 +391,7 @@ function ManageView({
                 {isOwner && !isCurrentUser && (
                   <button
                     type="button"
-                    onClick={() => handleRemove(m.user_id)}
+                    onClick={() => setPendingRemove(m)}
                     disabled={removing === m.user_id}
                     className="opacity-0 group-hover:opacity-100 h-6 w-6 rounded flex items-center justify-center text-text-tertiary hover:text-status-error hover:bg-status-error/10 transition-all"
                   >
@@ -410,6 +411,17 @@ function ManageView({
           <p className="text-sm text-text-tertiary text-center py-8">No members yet</p>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingRemove !== null}
+        onOpenChange={(open) => { if (!open) setPendingRemove(null) }}
+        title={`Remove ${pendingRemove?.user.name ?? 'this member'} from the project?`}
+        description="They'll lose access immediately. You can invite them again any time."
+        confirmLabel="Remove"
+        variant="danger"
+        loading={removing === pendingRemove?.user_id}
+        onConfirm={confirmRemove}
+      />
     </div>
   )
 }

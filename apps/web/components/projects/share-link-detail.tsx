@@ -27,6 +27,7 @@ import {
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { ShareLinkActivityPanel } from "@/components/projects/share-link-activity";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import type { ShareLink, ShareLinkAppearance } from "@/types";
 
 // ─── Shared hook for share link data + mutations ────────────────────────────
@@ -195,6 +196,8 @@ function ShareUserSearch({ shareLink }: { shareLink: ShareLink }) {
   const [sending, setSending] = React.useState(false);
   const [sent, setSent] = React.useState<string | null>(null);
   const [invitedUsers, setInvitedUsers] = React.useState<InvitedUser[]>([]);
+  const [pendingRevoke, setPendingRevoke] = React.useState<InvitedUser | null>(null);
+  const [revoking, setRevoking] = React.useState(false);
   const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
 
@@ -422,32 +425,7 @@ function ShareUserSearch({ shareLink }: { shareLink: ShareLink }) {
                 {user.permission}
               </span>
               <button
-                onClick={async () => {
-                  try {
-                    const targetId = shareLink.folder_id || shareLink.asset_id;
-                    const type = shareLink.folder_id ? "folders" : "assets";
-                    // Find the share ID for this user
-                    const shares = await api.get<
-                      Array<{ id: string; shared_with_user_id: string }>
-                    >(`/${type}/${targetId}/direct-shares`);
-                    const share = shares.find(
-                      (s) => s.shared_with_user_id === user.id,
-                    );
-                    if (share && shareLink.folder_id) {
-                      await api.delete(
-                        `/folders/${shareLink.folder_id}/shares/${share.id}`,
-                      );
-                    }
-                    // For assets, we'd need a similar delete endpoint — for now just remove from UI
-                    setInvitedUsers((prev) =>
-                      prev.filter((u) => u.id !== user.id),
-                    );
-                  } catch {
-                    setInvitedUsers((prev) =>
-                      prev.filter((u) => u.id !== user.id),
-                    );
-                  }
-                }}
+                onClick={() => setPendingRevoke(user)}
                 className="text-text-tertiary hover:text-red-400 transition-colors shrink-0"
                 title="Remove access"
               >
@@ -457,6 +435,44 @@ function ShareUserSearch({ shareLink }: { shareLink: ShareLink }) {
           ))}
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingRevoke !== null}
+        onOpenChange={(open) => { if (!open) setPendingRevoke(null); }}
+        title={`Revoke access for ${pendingRevoke?.name || pendingRevoke?.email || 'this user'}?`}
+        description="They'll lose access to this shared content immediately. You can re-invite them any time."
+        confirmLabel="Revoke access"
+        variant="danger"
+        loading={revoking}
+        onConfirm={async () => {
+          if (!pendingRevoke) return;
+          setRevoking(true);
+          try {
+            const targetId = shareLink.folder_id || shareLink.asset_id;
+            const type = shareLink.folder_id ? "folders" : "assets";
+            const shares = await api.get<
+              Array<{ id: string; shared_with_user_id: string }>
+            >(`/${type}/${targetId}/direct-shares`);
+            const share = shares.find(
+              (s) => s.shared_with_user_id === pendingRevoke.id,
+            );
+            if (share && shareLink.folder_id) {
+              await api.delete(
+                `/folders/${shareLink.folder_id}/shares/${share.id}`,
+              );
+            }
+            setInvitedUsers((prev) =>
+              prev.filter((u) => u.id !== pendingRevoke.id),
+            );
+          } catch {
+            setInvitedUsers((prev) =>
+              prev.filter((u) => u.id !== pendingRevoke.id),
+            );
+          } finally {
+            setRevoking(false);
+          }
+        }}
+      />
     </div>
   );
 }

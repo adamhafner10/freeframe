@@ -20,6 +20,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { api } from "@/lib/api";
 import { useShareLinks } from "@/hooks/use-share-links";
 import { ShareCreateDialog } from "@/components/projects/share-create-dialog";
@@ -148,6 +149,7 @@ function LinkTab({ assetId }: LinkTabProps) {
   );
   const [loadingLinks, setLoadingLinks] = React.useState(true);
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  const [pendingDeleteLink, setPendingDeleteLink] = React.useState<(ShareLink & { url?: string }) | null>(null);
 
   // Load existing links
   React.useEffect(() => {
@@ -188,13 +190,13 @@ function LinkTab({ assetId }: LinkTabProps) {
     }
   }
 
-  async function handleDelete(linkId: string) {
+  async function confirmDeleteLink() {
+    if (!pendingDeleteLink) return;
+    const linkId = pendingDeleteLink.id;
     setDeletingId(linkId);
     try {
       await api.delete(`/share/${linkId}`);
       setLinks((prev) => prev.filter((l) => l.id !== linkId));
-    } catch {
-      // silent
     } finally {
       setDeletingId(null);
     }
@@ -315,7 +317,7 @@ function LinkTab({ assetId }: LinkTabProps) {
                     </div>
                     <CopyButton text={linkUrl} />
                     <button
-                      onClick={() => handleDelete(link.id)}
+                      onClick={() => setPendingDeleteLink(link)}
                       disabled={deletingId === link.id}
                       className="text-text-tertiary hover:text-status-error transition-colors disabled:opacity-50"
                     >
@@ -332,6 +334,17 @@ function LinkTab({ assetId }: LinkTabProps) {
           )}
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDeleteLink !== null}
+        onOpenChange={(open) => { if (!open) setPendingDeleteLink(null); }}
+        title="Delete this share link?"
+        description="Anyone who has the link will lose access immediately. You can generate a new link any time."
+        confirmLabel="Delete link"
+        variant="danger"
+        loading={deletingId === pendingDeleteLink?.id}
+        onConfirm={confirmDeleteLink}
+      />
     </div>
   );
 }

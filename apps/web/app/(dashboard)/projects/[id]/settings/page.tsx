@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type {
   ProjectBranding,
   WatermarkSettings,
@@ -506,13 +507,17 @@ function MetadataTab({ projectId }: { projectId: string }) {
     key,
     () => api.get<MetadataField[]>(key),
   )
+  const [pendingDelete, setPendingDelete] = React.useState<MetadataField | null>(null)
+  const [deleting, setDeleting] = React.useState(false)
 
-  const handleDelete = async (fieldId: string) => {
+  const handleDelete = async () => {
+    if (!pendingDelete) return
+    setDeleting(true)
     try {
-      await api.delete(`/metadata-fields/${fieldId}`)
+      await api.delete(`/metadata-fields/${pendingDelete.id}`)
       globalMutate(key)
-    } catch {
-      // ignore
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -566,7 +571,7 @@ function MetadataTab({ projectId }: { projectId: string }) {
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => handleDelete(field.id)}
+                      onClick={() => setPendingDelete(field)}
                       className="text-status-error hover:text-status-error"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -578,6 +583,17 @@ function MetadataTab({ projectId }: { projectId: string }) {
           </table>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => { if (!open) setPendingDelete(null) }}
+        title={`Delete field "${pendingDelete?.name}"?`}
+        description="This removes the field definition and clears any values set on assets in this project. This can't be undone."
+        confirmLabel="Delete field"
+        variant="danger"
+        loading={deleting}
+        onConfirm={handleDelete}
+      />
     </div>
   )
 }
