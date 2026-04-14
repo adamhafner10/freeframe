@@ -1,15 +1,22 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
+from typing import Annotated
 import uuid
 from ..models.user import UserStatus
+
+
+# bcrypt silently truncates at 72 bytes, so we cap a bit under that to keep
+# the "password" the user types equal to the one we verify against later.
+Password = Annotated[str, Field(min_length=8, max_length=64)]
+
 
 class RegisterRequest(BaseModel):
     email: EmailStr
     name: str
-    password: str
+    password: Password
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str  # no min_length here — we validate against stored hash, not create
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -50,12 +57,12 @@ class VerifyMagicCodeRequest(BaseModel):
     code: str
 
 class SetPasswordRequest(BaseModel):
-    password: str
+    password: Password
 
 # Invite flow
 class AcceptInviteRequest(BaseModel):
     token: str
-    password: str
+    password: Password
 
 class InviteInfoResponse(BaseModel):
     email: str
