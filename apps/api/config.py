@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # If mail_provider is "smtp", uses standard SMTP with smtp_* settings
     mail_provider: str = "ses"  # "ses" or "smtp"
     mail_from_address: str = "noreply@example.com"
-    mail_from_name: str = "FreeFrame"
+    mail_from_name: str = "FileStream"
     
     # AWS SES settings
     aws_mail_access_key_id: str | None = None

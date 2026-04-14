@@ -16,11 +16,11 @@ async def lifespan(app: FastAPI):
 _disable_docs = os.getenv("DISABLE_DOCS", "").lower() in ("true", "1", "yes")
 
 app = FastAPI(
-    title="FreeFrame API",
-    description="Media review platform API",
+    title="FileStream API",
+    description="FileStream media review platform API — Powered by Cadence",
     version="1.0.0",
     lifespan=lifespan,
-    contact={"name": "FreeFrame", "url": "https://github.com/Techiebutler/freeframe"},
+    contact={"name": "FileStream"},
     license_info={"name": "MIT"},
     docs_url=None if _disable_docs else "/docs",
     redoc_url=None if _disable_docs else "/redoc",

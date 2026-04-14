@@ -73,7 +73,7 @@ def invite_user(body: InviteRequest, db: Session = Depends(get_db), current_user
     
     # Send invite email
     invite_url = f"{settings.frontend_url}/invite/{invite_token}"
-    send_task_safe(send_invite_email, user.email, current_user.name or "Admin", "FreeFrame", invite_url)
+    send_task_safe(send_invite_email, user.email, current_user.name or "Admin", "FileStream", invite_url)
     
     return user
 
