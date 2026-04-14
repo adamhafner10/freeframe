@@ -85,6 +85,19 @@ class FFmpegTranscoder(BaseTranscoder):
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
+            # 2. Detect audio presence so we can skip audio mapping on silent inputs
+            audio_probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "quiet", "-print_format", "json",
+                    "-show_streams", "-select_streams", "a:0", input_url,
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            try:
+                has_audio = bool(json.loads(audio_probe.stdout or "{}").get("streams"))
+            except json.JSONDecodeError:
+                has_audio = False
+
             # 3. Build quality ladder based on available qualities
             QUALITY_MAP = {
                 "1080p": ("1920:1080", 20),
@@ -113,11 +126,18 @@ class FFmpegTranscoder(BaseTranscoder):
 
             for i, quality in enumerate(qualities):
                 scale, crf = QUALITY_MAP[quality]
+                ffmpeg_cmd += ["-map", f"[{quality}]"]
+                if has_audio:
+                    ffmpeg_cmd += ["-map", "a:0"]
                 ffmpeg_cmd += [
-                    "-map", f"[{quality}]", "-map", "a:0",
                     f"-c:v:{i}", "libx264", f"-crf", str(crf), "-preset", "fast",
                     "-force_key_frames", "expr:gte(t,n_forced*2)",
                 ]
+
+            if has_audio:
+                var_stream_map = " ".join(f"v:{i},a:{i}" for i in range(len(qualities)))
+            else:
+                var_stream_map = " ".join(f"v:{i}" for i in range(len(qualities)))
 
             segment_dir = hls_dir / "%v"
             ffmpeg_cmd += [
@@ -127,7 +147,7 @@ class FFmpegTranscoder(BaseTranscoder):
                 "-hls_flags", "independent_segments",
                 "-hls_segment_type", "mpegts",
                 "-master_pl_name", "master.m3u8",
-                "-var_stream_map", " ".join(f"v:{i},a:{i}" for i in range(len(qualities))),
+                "-var_stream_map", var_stream_map,
                 "-hls_segment_filename", str(hls_dir / "%v" / "seg_%03d.ts"),
                 str(hls_dir / "%v" / "playlist.m3u8"),
             ]
