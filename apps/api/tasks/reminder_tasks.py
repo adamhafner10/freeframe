@@ -1,8 +1,34 @@
 from .celery_app import celery_app
 from ..database import SessionLocal
-from ..models.asset import Asset
+from ..models.asset import Asset, AssetVersion, ProcessingStatus
 from ..models.activity import Notification, NotificationType
 from datetime import datetime, timezone, timedelta
+
+
+@celery_app.task(name="cleanup_stuck_uploads")
+def cleanup_stuck_uploads():
+    """Mark as failed any AssetVersion that's been in `uploading` state for >30 min.
+
+    Reasons a version gets stuck `uploading`:
+    - User refreshed/closed the tab mid-upload (the /upload/abort cleanup never ran)
+    - Network died between the last part PUT and POST /upload/complete
+    - B2 presigned URL expired mid-upload
+
+    Frame.io-style UX: rather than leaving the row in silent limbo, flip it to
+    `failed` so the UploadsPanel shows it clearly with a Retry button.
+    """
+    with SessionLocal() as db:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+        stuck = db.query(AssetVersion).filter(
+            AssetVersion.processing_status == ProcessingStatus.uploading,
+            AssetVersion.created_at < cutoff,
+            AssetVersion.deleted_at.is_(None),
+        ).all()
+        for v in stuck:
+            v.processing_status = ProcessingStatus.failed
+        if stuck:
+            db.commit()
+        return {"cleaned": len(stuck)}
 
 
 @celery_app.task(name="send_due_date_reminders")

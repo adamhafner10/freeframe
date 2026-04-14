@@ -291,10 +291,13 @@ def validate_share_link_endpoint(
         thumbnail_url = None
         if media_file and media_file.s3_key_thumbnail:
             thumbnail_url = generate_presigned_get_url(media_file.s3_key_thumbnail)
-        # Get stream URL
+        # Get stream URL — prefer HLS (master.m3u8) once processed, otherwise serve
+        # the original file directly so playback works the moment upload completes.
         stream_url = None
         if media_file:
-            if media_file.s3_key_processed:
+            if media_file.s3_key_processed and asset.asset_type.value == "video":
+                stream_url = generate_presigned_get_url(f"{media_file.s3_key_processed}/master.m3u8")
+            elif media_file.s3_key_processed:
                 stream_url = generate_presigned_get_url(media_file.s3_key_processed)
             elif media_file.s3_key_raw:
                 stream_url = generate_presigned_get_url(media_file.s3_key_raw)

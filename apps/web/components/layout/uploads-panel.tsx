@@ -85,10 +85,23 @@ function StatusBadge({ status }: { status: UploadStatus }) {
 // ─── Upload Item ──────────────────────────────────────────────────────────────
 
 function UploadItem({ upload }: { upload: UploadFile }) {
-  const { cancelUpload, removeFile } = useUploadStore()
+  const { cancelUpload, removeFile, startUpload } = useUploadStore()
+  const retryInputRef = React.useRef<HTMLInputElement | null>(null)
   const isUploading = upload.status === 'pending' || upload.status === 'uploading'
   const isProcessing = upload.status === 'processing'
   const showProgress = isUploading || isProcessing
+
+  function handleRetry() {
+    retryInputRef.current?.click()
+  }
+
+  function handleRetryFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    startUpload(file, upload.projectId, upload.assetName, upload.projectName, upload.folderId ?? null)
+    removeFile(upload.id)
+    e.target.value = ''
+  }
 
   const progressValue = isProcessing ? upload.processingProgress : upload.progress
 
@@ -166,13 +179,29 @@ function UploadItem({ upload }: { upload: UploadFile }) {
           </button>
         )}
         {upload.status === 'failed' && (
-          <button
-            onClick={() => removeFile(upload.id)}
-            className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
-            title="Dismiss"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
+          <>
+            <input
+              ref={retryInputRef}
+              type="file"
+              accept={upload.fileType || '*/*'}
+              className="hidden"
+              onChange={handleRetryFileSelected}
+            />
+            <button
+              onClick={handleRetry}
+              className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-accent hover:bg-bg-hover transition-colors"
+              title="Re-upload"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => removeFile(upload.id)}
+              className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
+              title="Dismiss"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </>
         )}
       </div>
     </div>

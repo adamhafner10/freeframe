@@ -61,6 +61,10 @@ celery_app.conf.beat_schedule = {
         "task": "send_due_date_reminders",
         "schedule": crontab(minute="0"),  # every hour
     },
+    "cleanup-stuck-uploads": {
+        "task": "cleanup_stuck_uploads",
+        "schedule": crontab(minute="*/5"),  # every 5 minutes
+    },
 }
 
 

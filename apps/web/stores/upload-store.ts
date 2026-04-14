@@ -16,6 +16,7 @@ export interface UploadFile {
   projectId: string
   projectName?: string
   assetName: string
+  folderId?: string | null
   progress: number
   processingProgress: number
   status: UploadStatus
@@ -23,6 +24,7 @@ export interface UploadFile {
   assetId?: string
   versionId?: string
   uploadId?: string
+  s3Key?: string
   createdAt: number // timestamp for grouping
 }
 
@@ -94,6 +96,7 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
     .map((a) => {
       const v = a.latest_version!
       const file = v.files?.[0]
+      const status = mapProcessingStatus(v.processing_status)
       return {
         id: `history-${a.id}`,
         fileName: file?.original_filename ?? a.name,
@@ -101,9 +104,12 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
         fileType: file?.mime_type ?? mimeFromAssetType(a.asset_type),
         projectId: a.project_id,
         assetName: a.name,
-        progress: 100,
-        processingProgress: v.processing_status === 'ready' ? 100 : 0,
-        status: mapProcessingStatus(v.processing_status),
+        progress: status === 'failed' ? 0 : 100,
+        processingProgress: status === 'complete' ? 100 : 0,
+        status,
+        // For items whose status flipped server-side (eg the cleanup beat task
+        // flipped a stuck 'uploading' → 'failed'), surface a default reason.
+        error: status === 'failed' ? 'Upload interrupted. Re-upload to continue.' : undefined,
         assetId: a.id,
         versionId: v.id,
         createdAt: new Date(v.created_at).getTime(),
@@ -134,6 +140,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       projectId,
       projectName,
       assetName,
+      folderId: folderId ?? null,
       progress: 0,
       processingProgress: 0,
       status: 'pending',
@@ -177,7 +184,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         version_id = initRes.version_id
         const asset_id = initRes.asset_id
 
-        updateFile(id, { uploadId: upload_id, assetId: asset_id, versionId: version_id })
+        updateFile(id, { uploadId: upload_id, assetId: asset_id, versionId: version_id, s3Key: s3_key })
 
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
         const parts: Array<{ PartNumber: number; ETag: string }> = []
@@ -291,7 +298,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         upload_id = initRes.upload_id
         s3_key = initRes.s3_key
         version_id = initRes.version_id
-        updateFile(id, { uploadId: upload_id, versionId: version_id })
+        updateFile(id, { uploadId: upload_id, versionId: version_id, s3Key: s3_key })
 
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
         const parts: Array<{ PartNumber: number; ETag: string }> = []

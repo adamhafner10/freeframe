@@ -145,19 +145,26 @@ def complete_upload(
     # Then complete S3 multipart
     complete_multipart_upload(body.s3_key, body.upload_id, [p.model_dump() for p in body.parts])
 
-    version.processing_status = ProcessingStatus.processing
+    # Mark ready *immediately* — the original file is already in B2 and the asset
+    # endpoint falls back to s3_key_raw when s3_key_processed is empty, so playback
+    # works as soon as this commits. The HLS ladder + thumbnail are quality
+    # optimizations that run in the background without blocking the user.
+    version.processing_status = ProcessingStatus.ready
     db.commit()
 
-    # Trigger transcoding in background (task dispatched in Step 7)
     background_tasks.add_task(_trigger_processing, body.asset_id, body.version_id)
 
-    return CompleteUploadResponse(status="processing", asset_id=body.asset_id, version_id=body.version_id)
+    return CompleteUploadResponse(status="ready", asset_id=body.asset_id, version_id=body.version_id)
 
 
 def _trigger_processing(asset_id: uuid.UUID, version_id: uuid.UUID):
-    """Dispatch Celery task to process the uploaded asset."""
-    from ..tasks.transcode_tasks import process_asset
+    """Dispatch background Celery tasks:
+       - generate_thumbnail: fast single-frame extraction (~3s) — user sees poster quickly
+       - process_asset: full HLS ladder for adaptive streaming (slower)
+    Neither blocks playback of the original file."""
+    from ..tasks.transcode_tasks import process_asset, generate_thumbnail
     from ..tasks.celery_app import send_task_safe
+    send_task_safe(generate_thumbnail, str(asset_id), str(version_id))
     send_task_safe(process_asset, str(asset_id), str(version_id))
 
 
