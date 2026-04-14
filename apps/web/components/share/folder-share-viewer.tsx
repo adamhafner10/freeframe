@@ -977,8 +977,8 @@ export function FolderShareViewer({
 
   // Set page title
   React.useEffect(() => {
-    document.title = title ? `${title} – FreeFrame` : 'FreeFrame'
-    return () => { document.title = 'FreeFrame' }
+    document.title = title ? `${title} – FileStream` : 'FileStream'
+    return () => { document.title = 'FileStream' }
   }, [title])
   const [selectedAsset, setSelectedAsset] = React.useState<FolderShareAssetItem | null>(null)
 

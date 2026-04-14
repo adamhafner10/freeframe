@@ -70,7 +70,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
           collapsed ? 'justify-center px-0' : 'px-4 gap-2.5',
         )}
       >
-        {/* Logo: theme-aware custom logo, or default FreeFrame icons */}
+        {/* Logo: theme-aware custom logo, or default FileStream icons */}
         {customLogo ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img

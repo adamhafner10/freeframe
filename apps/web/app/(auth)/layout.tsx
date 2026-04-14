@@ -2,7 +2,7 @@ import type { Metadata } from 'next'
 import Image from 'next/image'
 
 export const metadata: Metadata = {
-  title: 'FreeFrame — Auth',
+  title: 'FileStream — Auth',
 }
 
 export default function AuthLayout({
@@ -21,7 +21,7 @@ export default function AuthLayout({
       <div className="relative mb-10">
         <Image
           src="/logo-full.png"
-          alt="FreeFrame"
+          alt="Cadence"
           width={180}
           height={48}
           priority
@@ -36,7 +36,7 @@ export default function AuthLayout({
 
       {/* Footer */}
       <p className="relative mt-8 text-2xs text-text-tertiary">
-        Collaborative media review &amp; approval
+        Powered by Cadence
       </p>
     </div>
   )

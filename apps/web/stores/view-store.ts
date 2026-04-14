@@ -72,6 +72,6 @@ export const useViewStore = create<ViewStore>()(
       toggleRightPanel: () =>
         set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
     }),
-    { name: 'freeframe-view-settings' },
+    { name: 'cadence-view-settings' },
   ),
 )

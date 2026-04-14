@@ -16,19 +16,19 @@ interface BrandingState {
 export const useBrandingStore = create<BrandingState>()(
   persist(
     (set) => ({
-      orgName: 'FreeFrame',
+      orgName: 'FileStream',
       orgLogoDark: null,
       orgLogoLight: null,
       setOrgName: (name) => set({ orgName: name }),
       setOrgLogoDark: (url) => set({ orgLogoDark: url }),
       setOrgLogoLight: (url) => set({ orgLogoLight: url }),
-      resetAll: () => set({ orgName: 'FreeFrame', orgLogoDark: null, orgLogoLight: null }),
+      resetAll: () => set({ orgName: 'FileStream', orgLogoDark: null, orgLogoLight: null }),
     }),
     {
       name: 'ff-branding',
       version: 2,
       migrate: () => ({
-        orgName: 'FreeFrame',
+        orgName: 'FileStream',
         orgLogoDark: null,
         orgLogoLight: null,
       }),

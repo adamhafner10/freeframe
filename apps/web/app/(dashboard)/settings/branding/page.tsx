@@ -104,7 +104,7 @@ export default function BrandingPage() {
   }
 
   const isAdmin = user?.is_superadmin
-  const hasCustomBranding = orgName !== 'FreeFrame' || orgLogoDark !== null || orgLogoLight !== null
+  const hasCustomBranding = orgName !== 'FileStream' || orgLogoDark !== null || orgLogoLight !== null
 
   // Which logo is active right now
   const activeLogo = theme === 'light' ? (orgLogoLight ?? orgLogoDark) : (orgLogoDark ?? orgLogoLight)
@@ -146,7 +146,7 @@ export default function BrandingPage() {
             <p className="text-sm text-text-secondary">{orgName}</p>
           )}
           <p className="text-xs text-text-tertiary">
-            Shown in the sidebar. Defaults to &ldquo;FreeFrame&rdquo;.
+            Shown in the sidebar. Defaults to &ldquo;FileStream&rdquo;.
           </p>
         </div>
       </section>
@@ -201,9 +201,9 @@ export default function BrandingPage() {
             ) : (
               <>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/logo-icon.png" alt="FreeFrame" className="h-6 w-6 object-contain logo-dark" />
+                <img src="/logo-icon.png" alt="Cadence" className="h-6 w-6 object-contain logo-dark" />
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/logo-icon-dark.png" alt="FreeFrame" className="h-6 w-6 object-contain logo-light" />
+                <img src="/logo-icon-dark.png" alt="Cadence" className="h-6 w-6 object-contain logo-light" />
               </>
             )}
           </div>
@@ -218,7 +218,7 @@ export default function BrandingPage() {
             variant="ghost"
             size="sm"
             className="text-status-error hover:text-status-error hover:bg-status-error/10 gap-1.5"
-            onClick={() => { resetAll(); setNameValue('FreeFrame') }}
+            onClick={() => { resetAll(); setNameValue('FileStream') }}
           >
             <RotateCcw className="h-3.5 w-3.5" />
             Reset to defaults

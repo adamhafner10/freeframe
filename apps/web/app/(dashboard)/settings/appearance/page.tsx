@@ -34,7 +34,7 @@ export default function AppearancePage() {
       <div className="mb-6">
         <h1 className="text-lg font-semibold text-text-primary">Appearance</h1>
         <p className="text-sm text-text-tertiary mt-1">
-          Customize how FreeFrame looks on your device.
+          Customize how FileStream looks on your device.
         </p>
       </div>
 

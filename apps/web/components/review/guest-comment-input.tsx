@@ -12,7 +12,7 @@ interface GuestIdentity {
   name: string
 }
 
-const STORAGE_KEY = 'freeframe_guest_identity'
+const STORAGE_KEY = 'cadence_guest_identity'
 
 function loadIdentity(): GuestIdentity | null {
   if (typeof window === 'undefined') return null

@@ -13,8 +13,8 @@ const dmSans = DM_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "FreeFrame",
-  description: "Collaborative media review and approval platform",
+  title: "FileStream",
+  description: "Powered by Cadence",
 };
 
 export const viewport: Viewport = {
