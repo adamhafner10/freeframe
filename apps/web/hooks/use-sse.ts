@@ -126,7 +126,10 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
       if (destroyed) return
 
       const token = getAccessToken()
-      const url = new URL(`${API_URL}/events/${projectId}`)
+      // API_URL is "/api" in prod (same-origin) but a full URL in dev.
+      // new URL() needs an absolute URL, so give it a base when relative.
+      const base = typeof window !== 'undefined' ? window.location.origin : 'http://localhost'
+      const url = new URL(`${API_URL}/events/${projectId}`, base)
       if (token) {
         url.searchParams.set('token', token)
       }
