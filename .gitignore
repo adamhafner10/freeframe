@@ -222,3 +222,6 @@ CLAUDE.md
 
 .DS_Store
 .worktrees/
+
+# Local-only credentials doc (never commit)
+SETUP-CREDENTIALS.md
