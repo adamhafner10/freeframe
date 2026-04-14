@@ -97,9 +97,10 @@ services:
       - traefik.http.routers.api.entrypoints=web
       - traefik.http.routers.api.middlewares=strip-api-prefix
       # HTTPS router (active when SSL is configured)
-      - traefik.http.routers.api-secure.rule=PathPrefix(`/api`)
+      - traefik.http.routers.api-secure.rule=Host(`${DOMAIN:-localhost}`) && PathPrefix(`/api`)
       - traefik.http.routers.api-secure.entrypoints=websecure
       - traefik.http.routers.api-secure.tls.certresolver=letsencrypt
+      - traefik.http.routers.api-secure.tls.domains[0].main=${DOMAIN:-localhost}
       - traefik.http.routers.api-secure.middlewares=strip-api-prefix
       - traefik.http.routers.api-secure.service=api
       # Shared
@@ -174,9 +175,10 @@ services:
       - traefik.http.routers.web.entrypoints=web
       - traefik.http.routers.web.priority=1
       # HTTPS router (active when SSL is configured)
-      - traefik.http.routers.web-secure.rule=PathPrefix(`/`)
+      - traefik.http.routers.web-secure.rule=Host(`${DOMAIN:-localhost}`) && PathPrefix(`/`)
       - traefik.http.routers.web-secure.entrypoints=websecure
       - traefik.http.routers.web-secure.tls.certresolver=letsencrypt
+      - traefik.http.routers.web-secure.tls.domains[0].main=${DOMAIN:-localhost}
       - traefik.http.routers.web-secure.priority=1
       - traefik.http.routers.web-secure.service=web
       - traefik.http.services.web.loadbalancer.server.port=3000
