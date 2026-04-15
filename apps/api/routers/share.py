@@ -37,6 +37,7 @@ from ..schemas.share import (
 from ..services.permissions import require_project_role, validate_share_link, validate_share_link_with_session
 from ..services.redis_service import create_share_session
 from ..services.s3_service import generate_presigned_get_url
+from ..routers.hls_proxy import create_hls_token
 from ..services.crypto_service import encrypt_password, decrypt_password
 from ..models.project import Project, ProjectRole
 from ..tasks.email_tasks import send_share_email
@@ -291,12 +292,14 @@ def validate_share_link_endpoint(
         thumbnail_url = None
         if media_file and media_file.s3_key_thumbnail:
             thumbnail_url = generate_presigned_get_url(media_file.s3_key_thumbnail)
-        # Get stream URL — prefer HLS (master.m3u8) once processed, otherwise serve
-        # the original file directly so playback works the moment upload completes.
+        # Get stream URL — route HLS through our proxy so variant playlists +
+        # segment URLs in the manifest stay signed; fall back to the original
+        # file until HLS transcoding finishes.
         stream_url = None
         if media_file:
             if media_file.s3_key_processed and asset.asset_type.value == "video":
-                stream_url = generate_presigned_get_url(f"{media_file.s3_key_processed}/master.m3u8")
+                token = create_hls_token(media_file.s3_key_processed)
+                stream_url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={token}"
             elif media_file.s3_key_processed:
                 stream_url = generate_presigned_get_url(media_file.s3_key_processed)
             elif media_file.s3_key_raw:
@@ -1364,12 +1367,14 @@ def get_share_stream_url(
     if not media_file:
         raise HTTPException(status_code=404, detail="No ready media file found")
 
-    # Generate presigned URL (same pattern as assets.py stream endpoint)
-    s3_key = media_file.s3_key_processed or media_file.s3_key_raw
+    # Playback URL: HLS goes through the proxy so variant + segment URLs stay
+    # signed; video w/o HLS yet serves the original file directly.
     if asset.asset_type == AssetType.video and media_file.s3_key_processed:
-        s3_key = f"{media_file.s3_key_processed}/master.m3u8"
-
-    url = generate_presigned_get_url(s3_key)
+        hls_token = create_hls_token(media_file.s3_key_processed)
+        url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={hls_token}"
+    else:
+        s3_key = media_file.s3_key_processed or media_file.s3_key_raw
+        url = generate_presigned_get_url(s3_key)
 
     # Log viewed_asset activity
     _log_share_activity(

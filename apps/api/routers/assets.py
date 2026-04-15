@@ -18,6 +18,8 @@ from ..services.permissions import require_project_role, require_asset_access, c
 from ..services.s3_service import generate_presigned_get_url
 from ..schemas.upload import InitiateUploadRequest, InitiateUploadResponse, ALLOWED_MIME_TYPES, MAX_FILE_SIZE_BYTES, mime_to_asset_type
 from ..services.s3_service import create_multipart_upload
+from ..routers.hls_proxy import create_hls_token
+from ..config import settings as _app_settings
 
 router = APIRouter(tags=["assets"])
 
@@ -261,13 +263,20 @@ def get_stream_url(
     if not media_file:
         raise HTTPException(status_code=404, detail="Media file not found")
 
-    # For video: return presigned HLS master.m3u8 URL
-    # For audio/image: return presigned direct URL
-    s3_key = media_file.s3_key_processed or media_file.s3_key_raw
+    # Playback URL selection:
+    # - Video w/ HLS processed: route through our /api/stream/hls proxy so that
+    #   variant playlists + segments in the manifest resolve against signed URLs
+    #   (the raw master.m3u8 in B2 references relative variant paths like
+    #   "0/playlist.m3u8" which would 403 on a private bucket without signing).
+    # - Video without HLS yet: serve the original file directly so playback works
+    #   immediately after upload while the HLS ladder transcodes in the background.
+    # - Audio/image: presigned direct URL to the processed output or raw file.
     if asset.asset_type == AssetType.video and media_file.s3_key_processed:
-        s3_key = f"{media_file.s3_key_processed}/master.m3u8"
-
-    url = generate_presigned_get_url(s3_key)
+        token = create_hls_token(media_file.s3_key_processed)
+        url = f"{_app_settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={token}"
+    else:
+        s3_key = media_file.s3_key_processed or media_file.s3_key_raw
+        url = generate_presigned_get_url(s3_key)
     return StreamUrlResponse(url=url, asset_type=asset.asset_type)
 
 
