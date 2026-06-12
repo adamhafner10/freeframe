@@ -2,11 +2,15 @@ from datetime import datetime, timezone, timedelta
 
 from .celery_app import celery_app
 from ..database import SessionLocal
-from ..models.asset import Asset, AssetVersion, MediaFile
+from ..models.asset import Asset, AssetVersion, MediaFile, ProcessingStatus, HLSStatus
 from ..services.s3_service import delete_object, delete_prefix
 
 # How long a soft-deleted row sits before storage is reaped and the row is hard-deleted.
 GRACE_DAYS = 7
+
+# A version whose raw is ready but whose HLS is still pending/failed/processing past
+# this window is presumed orphaned by a crashed worker and gets re-enqueued.
+HLS_SELFHEAL_MINUTES = 20
 
 
 @celery_app.task(name="reap_deleted_assets")
@@ -73,10 +77,9 @@ def reap_deleted_assets():
             deleted_objects += delete_prefix(
                 f"processed/{project_id}/{asset_id}/{version_id}"
             )
-            # video thumbnails are written to a separate prefix by generate_thumbnail
-            deleted_objects += delete_prefix(
-                f"processed/thumbnails/{asset_id}/{version_id}"
-            )
+            # NOTE: real thumbnails live UNDER processed/{project_id}/{asset_id}/{version_id}/
+            # which the prefix delete above already covers, so no separate thumbnail
+            # prefix delete is needed.
 
             for mf in t["media"]:
                 if mf["s3_key_raw"]:
@@ -128,3 +131,52 @@ def reap_deleted_assets():
         "reaped_assets": reaped_assets,
         "deleted_objects": deleted_objects,
     }
+
+
+@celery_app.task(name="reconcile_hls_transcodes")
+def reconcile_hls_transcodes():
+    """Self-heal: re-enqueue HLS transcodes that never finished.
+
+    A worker that crashes mid-transcode leaves a version with processing_status=ready
+    (raw is playable) but hls_status stuck at pending/processing/failed. This beat
+    finds those that are older than HLS_SELFHEAL_MINUTES and re-dispatches
+    process_asset for them. process_asset is idempotent — if the HLS output already
+    exists it simply reconciles hls_status to ready and returns, so this is safe to
+    run on a loop and never duplicates work.
+
+    Fresh session for the read; never holds a session across the dispatch.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=HLS_SELFHEAL_MINUTES)
+
+    targets = []  # list of (asset_id, version_id)
+    with SessionLocal() as db:
+        rows = (
+            db.query(AssetVersion)
+            .filter(
+                AssetVersion.deleted_at.is_(None),
+                AssetVersion.processing_status == ProcessingStatus.ready,
+                AssetVersion.hls_status.in_(
+                    [HLSStatus.pending, HLSStatus.processing, HLSStatus.failed]
+                ),
+                AssetVersion.created_at < cutoff,
+            )
+            .all()
+        )
+        targets = [(str(v.asset_id), str(v.id)) for v in rows]
+
+    if not targets:
+        return {"requeued": 0}
+
+    # Import locally to avoid a circular import at module load.
+    from .transcode_tasks import process_asset
+    from .celery_app import send_task_safe
+
+    requeued = 0
+    for asset_id, version_id in targets:
+        try:
+            send_task_safe(process_asset, asset_id, version_id)
+            requeued += 1
+        except Exception:
+            continue
+
+    return {"requeued": requeued}

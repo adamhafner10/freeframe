@@ -37,6 +37,7 @@ from ..services.permissions import (
     get_project_member,
     require_asset_access,
     require_project_role,
+    validate_asset_in_share,
     validate_share_link_with_session,
 )
 from ..tasks.email_tasks import send_mention_email, send_comment_email
@@ -692,6 +693,9 @@ def list_share_comments(
     target_asset_id = link.asset_id or asset_id
     if not target_asset_id:
         return {"comments": []}
+    # Confirm the asset is actually within this share's scope before exposing its
+    # comments — a caller-supplied asset_id must not escape the shared folder/project.
+    validate_asset_in_share(db, link, target_asset_id)
     asset_id = target_asset_id
 
     # External reviewers must never see internal/team-only comments. Load only
@@ -726,7 +730,9 @@ def guest_comment(
     target_asset_id = body.asset_id or link.asset_id
     if not target_asset_id:
         raise HTTPException(status_code=400, detail="asset_id is required for folder/project shares")
-    asset = _get_asset(db, target_asset_id)
+    # A caller-supplied asset_id must belong to this share's scope (folder/project),
+    # otherwise a valid token could be used to comment on arbitrary assets.
+    asset = validate_asset_in_share(db, link, target_asset_id)
 
     # Resolve version_id: use provided or get latest ready version
     version_id = body.version_id

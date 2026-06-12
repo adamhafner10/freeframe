@@ -20,8 +20,9 @@ from ..services.redis_service import (
     generate_magic_code, store_magic_code, verify_magic_code as redis_verify_magic_code,
     MAGIC_CODE_EXPIRY_SECONDS,
 )
-from ..tasks.email_tasks import send_magic_code_email, send_invite_email
+from ..tasks.email_tasks import send_magic_code_email, send_invite_email, render_template
 from ..tasks.celery_app import send_task_safe
+from ..services.email_service import email_service
 from ..models.user import User, UserStatus
 from ..middleware.auth import get_current_user
 from ..middleware.rate_limit import rate_limit
@@ -65,12 +66,32 @@ def send_magic_code(body: SendMagicCodeRequest, db: Session = Depends(get_db)):
     code = generate_magic_code()
     store_magic_code(body.email, code)
 
-    # Queue email via Celery (async)
+    # Send the magic-code email SYNCHRONOUSLY so we never return 200 unless the
+    # email actually went out. Magic code is the only auth path; a swallowed
+    # dispatch error here = total lockout with zero signal. SMTP via Resend/SES
+    # is fast and email_service uses a short socket timeout. On failure we return
+    # 503 (same response regardless of whether the user existed → no enumeration
+    # leak). We render the same template/subject the Celery task uses so emails
+    # stay identical.
     try:
-        send_task_safe(send_magic_code_email, body.email, code, MAGIC_CODE_EXPIRY_MINUTES)
+        subject = f"Your FileStream login code: {code}"
+        html_body = render_template(
+            "email/magic_code.html",
+            subject=subject,
+            code=code,
+            expiry_minutes=MAGIC_CODE_EXPIRY_MINUTES,
+        )
+        text_body = (
+            f"Your FileStream login code is: {code}. "
+            f"This code expires in {MAGIC_CODE_EXPIRY_MINUTES} minutes."
+        )
+        email_service.send_email_sync(body.email, subject, html_body, text_body)
     except Exception:
-        pass  # Email delivery is best-effort; code is already in Redis
-    
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to send login code right now. Please try again in a moment.",
+        )
+
     return SendMagicCodeResponse(
         message="Magic code sent to your email",
         email=body.email,

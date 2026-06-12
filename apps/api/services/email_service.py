@@ -6,6 +6,11 @@ import boto3
 from botocore.exceptions import ClientError
 from ..config import settings
 
+# Default socket timeout (seconds) for SMTP operations so the API never hangs
+# indefinitely on a dead mail server. Resend/SES SMTP is fast; keep this short
+# so login UX stays snappy and failures surface quickly.
+SMTP_TIMEOUT_SECONDS = 10
+
 
 class EmailService:
     """
@@ -33,17 +38,23 @@ class EmailService:
         subject: str,
         html_body: str,
         text_body: Optional[str] = None,
+        raise_on_error: bool = False,
     ) -> bool:
-        """Send email via AWS SES."""
+        """Send email via AWS SES.
+
+        When raise_on_error is True the underlying ClientError propagates so the
+        synchronous magic-code path can detect failure; otherwise failures are
+        logged and return False (best-effort contract for notifications).
+        """
         if not settings.aws_mail_access_key_id or not settings.aws_mail_secret_access_key:
             raise ValueError("AWS SES credentials not configured")
-        
+
         ses = self._get_ses_client()
-        
+
         body = {"Html": {"Charset": "UTF-8", "Data": html_body}}
         if text_body:
             body["Text"] = {"Charset": "UTF-8", "Data": text_body}
-        
+
         try:
             ses.send_email(
                 Source=f"{self.from_name} <{self.from_address}>",
@@ -56,6 +67,8 @@ class EmailService:
             return True
         except ClientError as e:
             print(f"SES error: {e.response['Error']['Message']}")
+            if raise_on_error:
+                raise
             return False
     
     def _send_via_smtp(
@@ -64,36 +77,56 @@ class EmailService:
         subject: str,
         html_body: str,
         text_body: Optional[str] = None,
+        raise_on_error: bool = False,
     ) -> bool:
-        """Send email via SMTP server."""
+        """Send email via SMTP server.
+
+        Uses a socket timeout so a dead mail server can't hang the caller.
+        When raise_on_error is True, the underlying exception propagates to the
+        caller (used by the synchronous magic-code path so the API can detect
+        failure and return 503). Otherwise failures are logged and return False
+        to preserve the best-effort contract for notification emails.
+        """
         if not settings.smtp_host:
             raise ValueError("SMTP host not configured")
-        
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = f"{self.from_name} <{self.from_address}>"
         msg["To"] = to_email
-        
+
         if text_body:
             msg.attach(MIMEText(text_body, "plain"))
         msg.attach(MIMEText(html_body, "html"))
-        
+
+        server = None
         try:
             if settings.smtp_use_tls:
-                server = smtplib.SMTP(settings.smtp_host, settings.smtp_port)
+                server = smtplib.SMTP(
+                    settings.smtp_host, settings.smtp_port, timeout=SMTP_TIMEOUT_SECONDS
+                )
                 server.starttls()
             else:
-                server = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port)
-            
+                server = smtplib.SMTP_SSL(
+                    settings.smtp_host, settings.smtp_port, timeout=SMTP_TIMEOUT_SECONDS
+                )
+
             if settings.smtp_user and settings.smtp_password:
                 server.login(settings.smtp_user, settings.smtp_password)
-            
+
             server.sendmail(self.from_address, [to_email], msg.as_string())
-            server.quit()
             return True
         except Exception as e:
             print(f"SMTP error: {e}")
+            if raise_on_error:
+                raise
             return False
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
     
     def send_email(
         self,
@@ -120,7 +153,66 @@ class EmailService:
             return self._send_via_smtp(to_email, subject, html_body, text_body)
         else:
             raise ValueError(f"Unknown mail provider: {self.provider}")
-    
+
+    def send_email_sync(
+        self,
+        to_email: str,
+        subject: str,
+        html_body: str,
+        text_body: Optional[str] = None,
+    ) -> bool:
+        """Send email synchronously, propagating failures to the caller.
+
+        Unlike send_email (best-effort, returns False on failure), this raises
+        if the email cannot be delivered. Used by the magic-code login path so
+        the API can return 503 instead of a misleading 200 when mail is down.
+
+        Returns True on success; raises on transport/provider failure.
+        """
+        if self.provider == "ses":
+            ok = self._send_via_ses(to_email, subject, html_body, text_body, raise_on_error=True)
+        elif self.provider == "smtp":
+            ok = self._send_via_smtp(to_email, subject, html_body, text_body, raise_on_error=True)
+        else:
+            raise ValueError(f"Unknown mail provider: {self.provider}")
+        if not ok:
+            raise RuntimeError("Email send reported failure")
+        return True
+
+    def check_smtp_health(self) -> bool:
+        """Lightweight SMTP reachability probe for health checks.
+
+        Connects, issues NOOP, and quits with a short timeout. Returns True if
+        the server responds, False on any failure. Never raises. Only meaningful
+        when the SMTP provider is configured; returns False otherwise.
+        """
+        if not settings.smtp_host:
+            return False
+        server = None
+        try:
+            if settings.smtp_use_tls:
+                server = smtplib.SMTP(
+                    settings.smtp_host, settings.smtp_port, timeout=SMTP_TIMEOUT_SECONDS
+                )
+                server.starttls()
+            else:
+                server = smtplib.SMTP_SSL(
+                    settings.smtp_host, settings.smtp_port, timeout=SMTP_TIMEOUT_SECONDS
+                )
+            if settings.smtp_user and settings.smtp_password:
+                server.login(settings.smtp_user, settings.smtp_password)
+            code, _ = server.noop()
+            return 200 <= code < 400
+        except Exception as e:
+            print(f"SMTP health check failed: {e}")
+            return False
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+
     def send_invite_email(self, to_email: str, inviter_name: str, org_name: str, invite_link: str) -> bool:
         """Send organization invite email."""
         subject = f"You've been invited to join {org_name} on FileStream"

@@ -4,7 +4,8 @@ import uuid
 from ..models.user import User
 from ..models.project import Project, ProjectMember, ProjectRole
 from ..models.asset import Asset
-from ..models.share import AssetShare, ShareLink, SharePermission
+from ..models.folder import Folder
+from ..models.share import AssetShare, ShareLink, ShareLinkItem, SharePermission
 from ..services.redis_service import verify_share_session
 
 
@@ -156,3 +157,69 @@ def validate_share_link_with_session(
                 detail="Password required",
             )
     return link
+
+
+def _folder_is_descendant_of(db: Session, folder_id: uuid.UUID, ancestor_id: uuid.UUID) -> bool:
+    """Return True if folder_id == ancestor_id or is nested under it via parent chain."""
+    current_id = folder_id
+    visited: set = set()
+    while current_id and current_id not in visited:
+        if current_id == ancestor_id:
+            return True
+        visited.add(current_id)
+        row = db.query(Folder.parent_id).filter(Folder.id == current_id).first()
+        current_id = row.parent_id if row else None
+    return False
+
+
+def validate_asset_in_share(db: Session, link: ShareLink, asset_id: uuid.UUID) -> Asset:
+    """Confirm a caller-supplied asset belongs to the share link's scope.
+
+    Mirrors the resolution used by the folder/project share asset listing so a
+    caller cannot pass an arbitrary asset_id alongside a valid share token:
+
+      - asset share   -> asset_id must equal link.asset_id
+      - folder share  -> asset must live in that folder or a descendant
+      - project share -> asset.project_id must equal link.project_id; if the
+                         link carries share_link_items (multi-share), the asset
+                         must be one of the selected assets OR live inside one of
+                         the selected folders (or their descendants)
+
+    Returns the resolved Asset on success; raises 404 if the asset doesn't
+    exist and 403 if it is outside the share's scope.
+    """
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.deleted_at.is_(None)).first()
+    if not asset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
+
+    if link.asset_id:
+        if asset.id != link.asset_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset does not match share link")
+        return asset
+
+    if link.folder_id:
+        if asset.folder_id and (
+            asset.folder_id == link.folder_id
+            or _folder_is_descendant_of(db, asset.folder_id, link.folder_id)
+        ):
+            return asset
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset is not within the shared folder")
+
+    if link.project_id:
+        if asset.project_id != link.project_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset is not within the shared project")
+        # Multi-share: restrict to explicitly selected assets/folders when items exist.
+        items = db.query(ShareLinkItem).filter(ShareLinkItem.share_link_id == link.id).all()
+        if items:
+            selected_asset_ids = {it.asset_id for it in items if it.asset_id}
+            selected_folder_ids = {it.folder_id for it in items if it.folder_id}
+            if asset.id in selected_asset_ids:
+                return asset
+            if asset.folder_id and any(
+                _folder_is_descendant_of(db, asset.folder_id, fid) for fid in selected_folder_ids
+            ):
+                return asset
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset is not in the shared items")
+        return asset
+
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid share link")

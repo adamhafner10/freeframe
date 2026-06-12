@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 from .celery_app import celery_app
 from ..database import SessionLocal
-from ..models.asset import AssetVersion, MediaFile, ProcessingStatus, AssetType, FileType
+from ..models.asset import AssetVersion, MediaFile, ProcessingStatus, HLSStatus, AssetType, FileType
 from ..models.asset import Asset
 from ..services.s3_service import get_s3_client
 from ..config import settings
@@ -27,13 +27,33 @@ def _run_async(coro):
         loop.close()
 
 
-def _set_failed(version_id: uuid.UUID) -> None:
-    """Fresh-session DB write to mark a version failed. Resilient to stale pool connections."""
+def _set_hls_status(version_id: uuid.UUID, status: HLSStatus) -> None:
+    """Fresh-session DB write to update HLS-transcode state. Resilient to stale pool connections.
+
+    IMPORTANT: this only touches hls_status. It must NEVER flip processing_status —
+    the raw upload is already playable, so an HLS failure can't brick the version.
+    """
     with SessionLocal() as db:
         v = db.query(AssetVersion).filter(AssetVersion.id == version_id).first()
         if v:
-            v.processing_status = ProcessingStatus.failed
+            v.hls_status = status
             db.commit()
+
+
+def _master_playlist_exists(hls_prefix: str, s3) -> bool:
+    """True if the HLS master playlist is present under the prefix.
+
+    The transcoder writes master.m3u8 LAST, so its presence means a prior run
+    actually completed — used to make re-runs idempotent. Missing key / any S3
+    error reads as 'not complete' so we (re)transcode rather than trust a partial.
+    """
+    if not hls_prefix:
+        return False
+    try:
+        s3.head_object(Bucket=settings.s3_bucket, Key=f"{hls_prefix.rstrip('/')}/master.m3u8")
+        return True
+    except Exception:
+        return False
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
@@ -47,6 +67,8 @@ def process_asset(self, asset_id: str, version_id: str):
     asset_uuid = uuid.UUID(asset_id)
     version_uuid = uuid.UUID(version_id)
 
+    s3 = get_s3_client()
+
     # 1. Read inputs with a short-lived session
     with SessionLocal() as db:
         version = db.query(AssetVersion).filter(AssetVersion.id == version_uuid).first()
@@ -54,26 +76,43 @@ def process_asset(self, asset_id: str, version_id: str):
             return  # version already cleaned up
         asset = db.query(Asset).filter(Asset.id == asset_uuid).first()
         if not asset:
-            _set_failed(version_uuid)
+            # No raw playability concern here — just mark the HLS pass failed.
+            _set_hls_status(version_uuid, HLSStatus.failed)
             return
         media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
         if not media_file:
-            _set_failed(version_uuid)
+            _set_hls_status(version_uuid, HLSStatus.failed)
             return
         project_id = str(asset.project_id)
         asset_type = asset.asset_type
         mf_id = media_file.id
+        existing_processed = media_file.s3_key_processed
         # Nothing else needed from this session; close it before the long ffmpeg run
         # so we don't pin a pool connection that Neon might recycle under us.
 
-    output_prefix = f"processed/{project_id}/{asset_id}/{version_id}"
-    s3 = get_s3_client()
+    # 1b. IDEMPOTENCY: if a prior run already produced a complete HLS output
+    #     (s3_key_processed set AND its master.m3u8 — written last — exists), this
+    #     is a safe no-op. Re-enqueues (retry endpoint / self-heal beat) won't
+    #     redo work. Reconcile hls_status to ready if it drifted.
+    if existing_processed and _master_playlist_exists(existing_processed, s3):
+        _set_hls_status(version_uuid, HLSStatus.ready)
+        return
 
-    # 2. Long operation — ffmpeg + uploads. No DB session held.
+    output_prefix = f"processed/{project_id}/{asset_id}/{version_id}"
+
+    # Mark in-flight so the self-heal beat doesn't double-enqueue a running job
+    # within its window.
+    _set_hls_status(version_uuid, HLSStatus.processing)
+
+    # 2. Long operation — ffmpeg + uploads. No DB session held. The transcoder
+    #    writes master.m3u8 LAST, so a crash mid-run leaves a partial output that
+    #    _master_playlist_exists() correctly treats as incomplete.
     try:
         result = _run_processing(asset_type, mf_id, output_prefix, s3)
     except Exception as exc:
-        _set_failed(version_uuid)
+        # HLS failed — raw stays playable, so we only mark hls_status=failed and
+        # NEVER touch processing_status. stream-url will fall back to the raw mp4.
+        _set_hls_status(version_uuid, HLSStatus.failed)
         _publish_event(project_id, "transcode_failed", {
             "asset_id": asset_id,
             "error": str(exc),
@@ -88,11 +127,11 @@ def process_asset(self, asset_id: str, version_id: str):
             thumb = result.get("thumbnail_key")
             if thumb and not mf.s3_key_thumbnail:
                 mf.s3_key_thumbnail = thumb
-        # Keep status=ready (upload flow already sets this). We don't regress it here
-        # even if it was somehow failed — fresh transcode success means we're good.
+        # processing_status is owned by the upload lifecycle — leave it alone.
+        # The streaming ladder is done, so flip hls_status to ready.
         v = db.query(AssetVersion).filter(AssetVersion.id == version_uuid).first()
-        if v and v.processing_status != ProcessingStatus.ready:
-            v.processing_status = ProcessingStatus.ready
+        if v:
+            v.hls_status = HLSStatus.ready
         db.commit()
 
     _publish_event(project_id, "transcode_complete", {
