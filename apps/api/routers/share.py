@@ -18,7 +18,7 @@ from ..models.folder import Folder
 from ..models.share import AssetShare, ShareLink, ShareLinkItem, SharePermission, ShareLinkActivity, ShareActivityAction
 from ..models.activity import ActivityLog, ActivityAction
 from ..models.branding import ProjectBranding
-from ..models.asset import AssetVersion, AssetType, MediaFile, ProcessingStatus
+from ..models.asset import AssetVersion, AssetType, MediaFile, ProcessingStatus, HLSStatus
 from ..models.comment import Comment
 from ..schemas.share import (
     DirectShareCreate,
@@ -34,7 +34,7 @@ from ..schemas.share import (
     ShareLinkUpdate,
     ShareLinkValidateResponse,
 )
-from ..services.permissions import require_project_role, validate_share_link, validate_share_link_with_session
+from ..services.permissions import get_project_member, require_project_role, validate_share_link, validate_share_link_with_session
 from ..services.redis_service import create_share_session
 from ..services.s3_service import generate_presigned_get_url
 from ..routers.hls_proxy import create_hls_token
@@ -164,6 +164,16 @@ def _get_latest_media_file(db: Session, asset_id: uuid.UUID) -> Optional[MediaFi
     if not version:
         return None
     return db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+
+
+def _hls_is_ready(db: Session, media_file: Optional[MediaFile]) -> bool:
+    """True only if the media file's version has a fully-completed HLS transcode.
+    Guards against serving a stale/partial HLS prefix during the self-heal/retry
+    window — fall back to the raw mp4 for playback when this is False."""
+    if not media_file or not media_file.s3_key_processed:
+        return False
+    version = db.query(AssetVersion).filter(AssetVersion.id == media_file.version_id).first()
+    return bool(version and version.hls_status == HLSStatus.ready)
 
 
 # ── Share links ───────────────────────────────────────────────────────────────
@@ -297,13 +307,16 @@ def validate_share_link_endpoint(
         # file until HLS transcoding finishes.
         stream_url = None
         if media_file:
-            if media_file.s3_key_processed and asset.asset_type.value == "video":
+            is_video = asset.asset_type.value == "video"
+            if is_video and _hls_is_ready(db, media_file):
                 token = create_hls_token(media_file.s3_key_processed)
                 stream_url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={token}"
+            elif media_file.s3_key_raw:
+                # Raw mp4 is playable inline while HLS is pending/failed — keeps a
+                # transcode hiccup from bricking playback.
+                stream_url = generate_presigned_get_url(media_file.s3_key_raw)
             elif media_file.s3_key_processed:
                 stream_url = generate_presigned_get_url(media_file.s3_key_processed)
-            elif media_file.s3_key_raw:
-                stream_url = generate_presigned_get_url(media_file.s3_key_raw)
 
         asset_data = {
             "id": str(asset.id),
@@ -353,11 +366,36 @@ def validate_share_link_endpoint(
     )
 
 
-def _share_link_response(link: ShareLink) -> ShareLinkResponse:
-    """Build ShareLinkResponse from ORM model, computing has_password and decrypting password."""
+def _can_reveal_share_password(db: Session, link: ShareLink, current_user: User) -> bool:
+    """Plaintext share passwords may only be revealed to the link creator or to
+    project owners/editors. Viewers/reviewers (and anyone reaching this via a
+    public/secure share flow) must never see the decrypted password."""
+    if link.created_by == current_user.id:
+        return True
+    project_id = _get_project_id_from_link(db, link)
+    member = get_project_member(db, project_id, current_user.id)
+    return bool(member and member.role in (ProjectRole.owner, ProjectRole.editor))
+
+
+def _share_link_response(
+    link: ShareLink,
+    db: Optional[Session] = None,
+    current_user: Optional[User] = None,
+) -> ShareLinkResponse:
+    """Build ShareLinkResponse from ORM model, computing has_password.
+
+    The decrypted plaintext password (``password_value``) is ONLY populated when
+    a privileged caller is supplied (the link creator or a project owner/editor).
+    It is never returned to viewers/reviewers or via public/secure share flows."""
     response = ShareLinkResponse.model_validate(link)
     response.has_password = link.password_hash is not None and link.password_hash != ''
-    if link.password_encrypted:
+    response.password_value = None
+    if (
+        link.password_encrypted
+        and db is not None
+        and current_user is not None
+        and _can_reveal_share_password(db, link, current_user)
+    ):
         try:
             response.password_value = decrypt_password(link.password_encrypted)
         except Exception:
@@ -382,7 +420,7 @@ def get_share_link_details(
         raise HTTPException(status_code=404, detail="Share link not found")
     project_id = _get_project_id_from_link(db, link)
     require_project_role(db, project_id, current_user, ProjectRole.viewer)
-    return _share_link_response(link)
+    return _share_link_response(link, db=db, current_user=current_user)
 
 
 # ── PATCH share link ─────────────────────────────────────────────────────────
@@ -423,7 +461,7 @@ def update_share_link(
 
     db.commit()
     db.refresh(link)
-    return _share_link_response(link)
+    return _share_link_response(link, db=db, current_user=current_user)
 
 
 @router.delete("/share/{token}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1371,12 +1409,20 @@ def get_share_stream_url(
 
     # Playback URL: HLS goes through the proxy so variant + segment URLs stay
     # signed; video w/o HLS yet serves the original file directly.
-    if asset.asset_type == AssetType.video and media_file.s3_key_processed:
-        hls_token = create_hls_token(media_file.s3_key_processed)
-        url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={hls_token}"
+    if asset.asset_type == AssetType.video:
+        if _hls_is_ready(db, media_file):
+            hls_token = create_hls_token(media_file.s3_key_processed)
+            url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={hls_token}"
+        elif media_file.s3_key_raw:
+            # HLS pending/failed: serve the raw mp4 for inline playback so a
+            # transcode hiccup never bricks viewing. This is viewing, not a
+            # download, so it is intentionally not gated on allow_download.
+            url = generate_presigned_get_url(media_file.s3_key_raw)
+        else:
+            raise HTTPException(status_code=404, detail="No playable media found")
     else:
-        # Serving the original/processed file directly is a download — gate it
-        # behind allow_download. HLS streaming above is viewing-only and stays open.
+        # A non-video original is served as a direct file download — gate it
+        # behind allow_download.
         if not link.allow_download:
             raise HTTPException(status_code=403, detail="Downloads are not allowed for this share link")
         s3_key = media_file.s3_key_processed or media_file.s3_key_raw

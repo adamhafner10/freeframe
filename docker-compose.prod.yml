@@ -123,6 +123,10 @@ services:
     healthcheck:
       disable: true
     restart: unless-stopped
+    # Cap the transcode worker so a concurrent-ffmpeg memory spike OOM-kills this
+    # container (auto-restarts; stuck transcodes self-heal via beat) instead of
+    # the host OOM-killer taking down api/web. Host also has a 6G swap cushion.
+    mem_limit: 5g
 
   email_worker:
     build:

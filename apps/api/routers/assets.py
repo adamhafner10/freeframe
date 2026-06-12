@@ -8,7 +8,7 @@ from typing import Optional
 from ..database import get_db
 from ..middleware.auth import get_current_user
 from ..models.user import User
-from ..models.asset import Asset, AssetVersion, MediaFile, AssetType, FileType, ProcessingStatus
+from ..models.asset import Asset, AssetVersion, MediaFile, AssetType, FileType, ProcessingStatus, HLSStatus
 from ..models.project import Project, ProjectMember, ProjectRole
 from ..models.share import AssetShare
 from ..models.activity import Mention, Notification, NotificationType
@@ -278,28 +278,88 @@ def get_stream_url(
 
     if not version:
         raise HTTPException(status_code=404, detail="No version found")
-    if version.processing_status != ProcessingStatus.ready:
-        raise HTTPException(status_code=409, detail="Asset version is not ready yet")
 
     media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+
+    # Playability is decoupled from HLS state. A version is playable as soon as its
+    # raw file is in storage (processing_status=ready) — a failed/pending HLS pass
+    # must NEVER block playback, because we fall back to the raw mp4 below.
+    # Only 409/425 when there is genuinely nothing to serve yet.
+    has_raw = bool(media_file and media_file.s3_key_raw)
+    has_hls = bool(media_file and media_file.s3_key_processed)
     if not media_file:
         raise HTTPException(status_code=404, detail="Media file not found")
+    if not has_raw and not has_hls:
+        # Upload hasn't landed any bytes — nothing playable. 425 Too Early.
+        raise HTTPException(status_code=425, detail="Asset version is not ready yet")
+    if version.processing_status != ProcessingStatus.ready and not has_hls:
+        # Still uploading / processing the raw and no streaming output exists yet.
+        raise HTTPException(status_code=409, detail="Asset version is not ready yet")
 
     # Playback URL selection:
-    # - Video w/ HLS processed: route through our /api/stream/hls proxy so that
+    # - Video w/ HLS ready: route through our /api/stream/hls proxy so that
     #   variant playlists + segments in the manifest resolve against signed URLs
     #   (the raw master.m3u8 in B2 references relative variant paths like
     #   "0/playlist.m3u8" which would 403 on a private bucket without signing).
-    # - Video without HLS yet: serve the original file directly so playback works
-    #   immediately after upload while the HLS ladder transcodes in the background.
+    # - Video without (or with FAILED) HLS: serve the original file directly so
+    #   playback works regardless of the streaming-ladder outcome. This is the
+    #   fix for failed transcodes bricking otherwise-good uploads.
     # - Audio/image: presigned direct URL to the processed output or raw file.
-    if asset.asset_type == AssetType.video and media_file.s3_key_processed:
+    if asset.asset_type == AssetType.video and has_hls and version.hls_status == HLSStatus.ready:
         token = create_hls_token(media_file.s3_key_processed)
         url = f"{_app_settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={token}"
     else:
-        s3_key = media_file.s3_key_processed or media_file.s3_key_raw
+        # Prefer processed output for audio/image; for video fall back to raw mp4.
+        if asset.asset_type == AssetType.video:
+            s3_key = media_file.s3_key_raw or media_file.s3_key_processed
+        else:
+            s3_key = media_file.s3_key_processed or media_file.s3_key_raw
         url = generate_presigned_get_url(s3_key)
     return StreamUrlResponse(url=url, asset_type=asset.asset_type)
+
+
+@router.post("/assets/{asset_id}/versions/{version_id}/retry", response_model=AssetVersionResponse)
+def retry_transcode(
+    asset_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Re-enqueue the HLS transcode for a version whose streaming ladder failed or
+    never ran. Editor+ only. Idempotent: process_asset early-returns if the HLS
+    output already exists, so spamming this is a no-op. Does not touch
+    processing_status — the raw file stays playable throughout."""
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.deleted_at.is_(None)).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    require_project_role(db, asset.project_id, current_user, ProjectRole.editor)
+
+    version = db.query(AssetVersion).filter(
+        AssetVersion.id == version_id,
+        AssetVersion.asset_id == asset_id,
+        AssetVersion.deleted_at.is_(None),
+    ).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+    if not media_file or not media_file.s3_key_raw:
+        raise HTTPException(status_code=409, detail="No raw media to transcode")
+
+    # Reset HLS state to pending and re-dispatch. process_asset is idempotent and
+    # will skip work if a complete master.m3u8 is already present.
+    version.hls_status = HLSStatus.pending
+    db.commit()
+    db.refresh(version)
+
+    from ..tasks.transcode_tasks import process_asset
+    from ..tasks.celery_app import send_task_safe
+    send_task_safe(process_asset, str(asset_id), str(version_id))
+
+    files = db.query(MediaFile).filter(MediaFile.version_id == version.id).all()
+    vr = AssetVersionResponse.model_validate(version)
+    vr.files = [MediaFileResponse.model_validate(f) for f in files]
+    return vr
 
 
 @router.post("/assets/{asset_id}/versions", response_model=InitiateUploadResponse)

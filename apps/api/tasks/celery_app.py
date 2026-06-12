@@ -70,6 +70,10 @@ celery_app.conf.beat_schedule = {
         "task": "reap_deleted_assets",
         "schedule": crontab(minute="0", hour="3"),  # daily at 03:00 UTC
     },
+    "reconcile-hls-transcodes": {
+        "task": "reconcile_hls_transcodes",
+        "schedule": crontab(minute="*/10"),  # every 10 min — self-heal crashed transcodes
+    },
 }
 
 

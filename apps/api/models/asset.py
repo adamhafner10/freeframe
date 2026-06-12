@@ -29,6 +29,18 @@ class ProcessingStatus(str, PyEnum):
     ready = "ready"
     failed = "failed"
 
+class HLSStatus(str, PyEnum):
+    """HLS transcode state, tracked SEPARATELY from processing_status.
+
+    processing_status governs the upload lifecycle + raw playability; this only
+    tracks the optional streaming-ladder pass. A failed HLS transcode must never
+    brick a version whose raw file plays fine.
+    """
+    pending = "pending"
+    processing = "processing"
+    ready = "ready"
+    failed = "failed"
+
 class Asset(Base):
     __tablename__ = "assets"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -58,6 +70,9 @@ class AssetVersion(Base):
     asset_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("assets.id"), nullable=False, index=True)
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     processing_status: Mapped[ProcessingStatus] = mapped_column(Enum(ProcessingStatus), default=ProcessingStatus.uploading)
+    # Streaming-ladder state, decoupled from processing_status so a FAILED HLS
+    # transcode never flips a playable (raw-ready) version to unplayable.
+    hls_status: Mapped[HLSStatus] = mapped_column(Enum(HLSStatus), default=HLSStatus.pending, server_default="pending")
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
