@@ -434,6 +434,21 @@ def validate_share_link_endpoint(
             elif media_file.s3_key_processed:
                 stream_url = generate_presigned_get_url(media_file.s3_key_processed)
 
+        # Surface HLS transcode status so the share viewer can show a
+        # "Processing…" state instead of a broken player when video isn't
+        # playable yet. Falls back to None for non-video / no-version assets.
+        hls_status_value = None
+        if media_file:
+            version = db.query(AssetVersion).filter(
+                AssetVersion.id == media_file.version_id
+            ).first()
+            if version and version.hls_status is not None:
+                hls_status_value = (
+                    version.hls_status.value
+                    if hasattr(version.hls_status, "value")
+                    else str(version.hls_status)
+                )
+
         asset_data = {
             "id": str(asset.id),
             "name": asset.name,
@@ -441,6 +456,7 @@ def validate_share_link_endpoint(
             "description": asset.description,
             "thumbnail_url": thumbnail_url,
             "stream_url": stream_url,
+            "hls_status": hls_status_value,
         }
         # Get project branding
         branding = db.query(ProjectBranding).filter(
