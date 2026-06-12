@@ -23,7 +23,7 @@ def test_openapi_title(client):
     resp = client.get("/openapi.json")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["info"]["title"] == "FreeFrame API"
+    assert data["info"]["title"] == "FileStream API"
 
 
 def test_openapi_contact(client):
@@ -31,7 +31,7 @@ def test_openapi_contact(client):
     assert resp.status_code == 200
     data = resp.json()
     assert "contact" in data["info"]
-    assert data["info"]["contact"]["name"] == "FreeFrame"
+    assert data["info"]["contact"]["name"] == "FileStream"
 
 
 def test_openapi_license(client):

@@ -1,4 +1,3 @@
-import json
 import boto3
 from botocore.exceptions import ClientError
 from ..config import settings
@@ -105,27 +104,8 @@ def ensure_bucket_exists():
         except ClientError:
             pass  # CORS config failed, non-critical
 
-        # Set public-read policy on processed/ prefix so HLS sub-playlists
-        # and .ts segments can be fetched without presigned URLs
-        try:
-            policy = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Sid": "PublicReadProcessed",
-                        "Effect": "Allow",
-                        "Principal": "*",
-                        "Action": "s3:GetObject",
-                        "Resource": f"arn:aws:s3:::{settings.s3_bucket}/processed/*",
-                    }
-                ],
-            }
-            s3.put_bucket_policy(
-                Bucket=settings.s3_bucket,
-                Policy=json.dumps(policy),
-            )
-        except ClientError:
-            pass  # Policy config failed, non-critical
+        # NOTE: bucket stays fully private — no public-read policy. processed/ HLS
+        # segments + thumbnails are served only via the HLS proxy + presigned URLs.
 
 
 def get_content_type(key: str) -> tuple[str, str]:
@@ -199,3 +179,22 @@ def put_object(s3_key: str, body: bytes, content_type: str | None = None, cache_
 def delete_object(s3_key: str) -> None:
     s3 = get_s3_client()
     s3.delete_object(Bucket=settings.s3_bucket, Key=s3_key)
+
+def delete_prefix(prefix: str) -> int:
+    """Delete every object under a prefix. Paginated, idempotent, returns count deleted.
+
+    Safe to re-run: a prefix with no objects deletes nothing and returns 0.
+    """
+    if not prefix:
+        return 0
+    s3 = get_s3_client()
+    deleted = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=settings.s3_bucket, Prefix=prefix):
+        objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if not objects:
+            continue
+        # delete_objects caps at 1000 keys per call; paginator pages are <=1000.
+        s3.delete_objects(Bucket=settings.s3_bucket, Delete={"Objects": objects})
+        deleted += len(objects)
+    return deleted

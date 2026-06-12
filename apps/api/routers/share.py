@@ -1158,9 +1158,11 @@ def get_folder_share_assets(
     per_page: int = 50,
     share_session: Optional[str] = Query(None, alias="share_session"),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
-    """Public endpoint — no auth required. Returns assets and subfolders for a folder or project share link."""
-    link = validate_share_link_with_session(db, token, share_session=share_session)
+    """Public endpoint — optional auth. Returns assets and subfolders for a folder or project share link.
+    Secure + password-protected links are enforced via the session-aware validator."""
+    link = validate_share_link_with_session(db, token, share_session=share_session, current_user=current_user)
 
     is_project_share = link.project_id is not None
     if not link.folder_id and not is_project_share:
@@ -1373,6 +1375,10 @@ def get_share_stream_url(
         hls_token = create_hls_token(media_file.s3_key_processed)
         url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={hls_token}"
     else:
+        # Serving the original/processed file directly is a download — gate it
+        # behind allow_download. HLS streaming above is viewing-only and stays open.
+        if not link.allow_download:
+            raise HTTPException(status_code=403, detail="Downloads are not allowed for this share link")
         s3_key = media_file.s3_key_processed or media_file.s3_key_raw
         url = generate_presigned_get_url(s3_key)
 
@@ -1406,9 +1412,11 @@ def get_share_thumbnail_url(
     asset_id: uuid.UUID,
     share_session: Optional[str] = Query(None, alias="share_session"),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
-    """Public endpoint — no auth required. Returns presigned thumbnail URL for an asset in a share link."""
-    link = validate_share_link_with_session(db, token, share_session=share_session)
+    """Public endpoint — optional auth. Returns presigned thumbnail URL for an asset in a share link.
+    Secure + password-protected links are enforced via the session-aware validator."""
+    link = validate_share_link_with_session(db, token, share_session=share_session, current_user=current_user)
 
     asset = _get_asset(db, asset_id)
 
