@@ -2,7 +2,7 @@ from pydantic import BaseModel
 import uuid
 from datetime import datetime
 from typing import Optional
-from ..models.asset import AssetType, AssetStatus, ProcessingStatus, FileType
+from ..models.asset import AssetType, AssetStatus, ProcessingStatus, HLSStatus, FileType
 from ..models.activity import NotificationType
 
 class MediaFileResponse(BaseModel):
@@ -27,6 +27,10 @@ class AssetVersionResponse(BaseModel):
     asset_id: uuid.UUID
     version_number: int
     processing_status: ProcessingStatus
+    # Streaming-ladder state, decoupled from processing_status. Lets the frontend
+    # render a transcoding/needs-retry badge ('pending'|'processing'|'ready'|'failed')
+    # and surface the retry affordance without bricking a raw-playable version.
+    hls_status: HLSStatus
     created_by: uuid.UUID
     created_at: datetime
     files: list[MediaFileResponse] = []
