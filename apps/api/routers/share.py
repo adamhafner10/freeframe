@@ -17,7 +17,7 @@ from ..models.asset import Asset
 from ..models.folder import Folder
 from ..models.share import AssetShare, ShareLink, ShareLinkItem, SharePermission, ShareLinkActivity, ShareActivityAction
 from ..models.activity import ActivityLog, ActivityAction
-from ..models.branding import ProjectBranding
+from ..models.branding import ProjectBranding, WatermarkSettings, WatermarkContent
 from ..models.asset import AssetVersion, AssetType, MediaFile, ProcessingStatus, HLSStatus
 from ..models.comment import Comment
 from ..schemas.share import (
@@ -176,6 +176,111 @@ def _hls_is_ready(db: Session, media_file: Optional[MediaFile]) -> bool:
     return bool(version and version.hls_status == HLSStatus.ready)
 
 
+def _project_watermark(db: Session, project_id: uuid.UUID) -> Optional[WatermarkSettings]:
+    """Return the enabled project-level (share_link_id IS NULL) watermark settings,
+    or None when watermarking isn't configured/enabled for the project."""
+    wm = db.query(WatermarkSettings).filter(
+        WatermarkSettings.project_id == project_id,
+        WatermarkSettings.share_link_id.is_(None),
+    ).first()
+    if not wm or not wm.enabled:
+        return None
+    return wm
+
+
+def _resolve_watermark_text(wm: WatermarkSettings, current_user: Optional[User]) -> str:
+    """Resolve the static watermark text from project settings.
+
+    Mirrors branding.apply_watermark_to_asset. Static design only — when the
+    content type references the viewer but there's no authenticated user (public
+    share), fall back to the custom text / empty string rather than inventing a
+    per-viewer dynamic watermark."""
+    if wm.content == WatermarkContent.email:
+        return current_user.email if current_user else (wm.custom_text or "")
+    if wm.content == WatermarkContent.name:
+        if current_user:
+            return current_user.name or current_user.email
+        return wm.custom_text or ""
+    return wm.custom_text or ""
+
+
+def _enqueue_watermark(db: Session, asset_id: uuid.UUID, project_id: uuid.UUID) -> None:
+    """Best-effort enqueue of the burn-watermark job for an asset, if the project
+    has watermarking enabled. Idempotent at the worker (skips when the burned
+    output already exists), so re-enqueueing on every share create/update is safe."""
+    wm = _project_watermark(db, project_id)
+    if not wm:
+        return
+    watermark_text = _resolve_watermark_text(wm, None)
+    from ..tasks.watermark_tasks import apply_watermark
+    send_task_safe(
+        apply_watermark,
+        str(asset_id),
+        watermark_text,
+        wm.position.value if hasattr(wm.position, "value") else wm.position,
+        wm.opacity,
+        None,  # image_key not stored in model
+    )
+
+
+def _enqueue_watermark_for_link(db: Session, link: ShareLink) -> None:
+    """Enqueue watermark burns for every asset reachable through a share link
+    when that link has show_watermark=True. Covers single-asset, folder, project,
+    and multi-item links. No-op when the project has no enabled watermark."""
+    if not link.show_watermark:
+        return
+    try:
+        project_id = _get_project_id_from_link(db, link)
+    except HTTPException:
+        return
+    wm = _project_watermark(db, project_id)
+    if not wm:
+        return
+
+    asset_ids: set[uuid.UUID] = set()
+    if link.asset_id:
+        asset_ids.add(link.asset_id)
+    # Folder / project / multi-item links: resolve member assets so each gets a burn.
+    folder_ids: list[uuid.UUID] = []
+    if link.folder_id:
+        folder_ids.append(link.folder_id)
+    items = db.query(ShareLinkItem).filter(ShareLinkItem.share_link_id == link.id).all()
+    for item in items:
+        if item.asset_id:
+            asset_ids.add(item.asset_id)
+        if item.folder_id:
+            folder_ids.append(item.folder_id)
+    if folder_ids:
+        folder_assets = db.query(Asset.id).filter(
+            Asset.folder_id.in_(folder_ids),
+            Asset.deleted_at.is_(None),
+            Asset.asset_type == AssetType.video,
+        ).all()
+        asset_ids.update(a.id for a in folder_assets)
+    elif link.project_id and not link.asset_id and not items:
+        # Whole-project share: burn every video asset in the project.
+        project_assets = db.query(Asset.id).filter(
+            Asset.project_id == link.project_id,
+            Asset.deleted_at.is_(None),
+            Asset.asset_type == AssetType.video,
+        ).all()
+        asset_ids.update(a.id for a in project_assets)
+
+    for aid in asset_ids:
+        _enqueue_watermark(db, aid, project_id)
+
+
+def _watermarked_url(db: Session, media_file: Optional[MediaFile]) -> Optional[str]:
+    """Presigned URL for the burned-watermark output if it exists, else None.
+
+    Watermark output is a single burned mp4 (not HLS), served via direct presigned
+    GET. None means the burn isn't ready yet — callers fall back to the clean source
+    only after confirming the share doesn't require a watermark."""
+    if not media_file or not media_file.s3_key_watermarked:
+        return None
+    return generate_presigned_get_url(media_file.s3_key_watermarked)
+
+
 # ── Share links ───────────────────────────────────────────────────────────────
 
 @router.post("/assets/{asset_id}/share", response_model=ShareLinkResponse, status_code=status.HTTP_201_CREATED)
@@ -217,6 +322,7 @@ def create_share_link(
     db.add(ActivityLog(user_id=current_user.id, asset_id=asset_id, action=ActivityAction.shared))
     db.commit()
     db.refresh(link)
+    _enqueue_watermark_for_link(db, link)
     return link
 
 
@@ -308,7 +414,17 @@ def validate_share_link_endpoint(
         stream_url = None
         if media_file:
             is_video = asset.asset_type.value == "video"
-            if is_video and _hls_is_ready(db, media_file):
+            wm_url = None
+            if link.show_watermark:
+                # Watermarked share: serve the burned mp4 when it's ready. If the
+                # burn isn't done yet, make sure the job is enqueued and fall back
+                # to the clean source (existing safest behavior) until it lands.
+                wm_url = _watermarked_url(db, media_file)
+                if not wm_url:
+                    _enqueue_watermark(db, asset.id, asset.project_id)
+            if wm_url:
+                stream_url = wm_url
+            elif is_video and _hls_is_ready(db, media_file):
                 token = create_hls_token(media_file.s3_key_processed)
                 stream_url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={token}"
             elif media_file.s3_key_raw:
@@ -461,6 +577,9 @@ def update_share_link(
 
     db.commit()
     db.refresh(link)
+    # If the link is (now) watermarked, make sure burns are enqueued for its assets.
+    # Idempotent at the worker, so this is safe whether or not show_watermark changed.
+    _enqueue_watermark_for_link(db, link)
     return _share_link_response(link, db=db, current_user=current_user)
 
 
@@ -519,6 +638,7 @@ def create_folder_share_link(
     db.add(link)
     db.commit()
     db.refresh(link)
+    _enqueue_watermark_for_link(db, link)
     return link
 
 
@@ -563,6 +683,7 @@ def create_project_share_link(
     db.add(link)
     db.commit()
     db.refresh(link)
+    _enqueue_watermark_for_link(db, link)
     return link
 
 
@@ -1107,6 +1228,13 @@ def add_asset_to_share_link(
     # Add the new asset
     db.add(ShareLinkItem(share_link_id=link.id, asset_id=asset_id))
     db.commit()
+    db.refresh(link)
+    # If this link is watermarked, enqueue a burn for the newly added asset so its
+    # watermarked output is ready when a viewer requests playback.
+    if link.show_watermark and asset.asset_type == AssetType.video:
+        wm = _project_watermark(db, asset.project_id)
+        if wm:
+            _enqueue_watermark(db, asset.id, asset.project_id)
     return {"detail": "Asset added to share link"}
 
 
@@ -1183,6 +1311,7 @@ def create_multi_share_link(
 
     db.commit()
     db.refresh(link)
+    _enqueue_watermark_for_link(db, link)
     return link
 
 
@@ -1407,9 +1536,20 @@ def get_share_stream_url(
     if not media_file:
         raise HTTPException(status_code=404, detail="No ready media file found")
 
+    # Watermarked share: serve the burned mp4 in place of the clean original/HLS
+    # when it's ready. If not ready yet, ensure the burn is enqueued and fall back
+    # to the clean playback chain below (existing safest behavior).
+    wm_url = None
+    if link.show_watermark and asset.asset_type == AssetType.video:
+        wm_url = _watermarked_url(db, media_file)
+        if not wm_url:
+            _enqueue_watermark(db, asset.id, asset.project_id)
+
     # Playback URL: HLS goes through the proxy so variant + segment URLs stay
     # signed; video w/o HLS yet serves the original file directly.
-    if asset.asset_type == AssetType.video:
+    if wm_url:
+        url = wm_url
+    elif asset.asset_type == AssetType.video:
         if _hls_is_ready(db, media_file):
             hls_token = create_hls_token(media_file.s3_key_processed)
             url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={hls_token}"

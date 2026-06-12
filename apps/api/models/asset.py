@@ -92,6 +92,10 @@ class MediaFile(Base):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     s3_key_raw: Mapped[str] = mapped_column(String(1000), nullable=False)
     s3_key_processed: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    # Burned-watermark output (drawtext overlay). Served instead of the clean
+    # raw/HLS only on share links with show_watermark=True. Nullable: most files
+    # never get a watermark pass; populated by apply_watermark() when it runs.
+    s3_key_watermarked: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     s3_key_thumbnail: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     height: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

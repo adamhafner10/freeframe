@@ -199,11 +199,15 @@ def apply_watermark_to_asset(
 
     from ..tasks.watermark_tasks import apply_watermark
     from ..tasks.celery_app import send_task_safe
+    # apply_watermark is idempotent: it skips re-encoding when the burned output
+    # already exists in S3, and persists media_files.s3_key_watermarked when done.
     send_task_safe(
         apply_watermark,
         str(asset_id),
         watermark_text,
-        wm.position,
+        # Pass the raw enum value so the worker's string comparison is stable
+        # regardless of Celery serialization of the enum member.
+        wm.position.value if hasattr(wm.position, "value") else wm.position,
         wm.opacity,
         None,  # image_key not stored in model
     )

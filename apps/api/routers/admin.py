@@ -1,15 +1,49 @@
 """Admin endpoints for user management."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, distinct
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 import uuid
 
 from ..database import get_db
 from ..middleware.auth import get_current_user
 from ..models.user import User, UserStatus
+from ..models.project import Project
+from ..models.asset import Asset, AssetVersion, MediaFile
 from ..schemas.auth import UserResponse, UpdateUserRoleRequest
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# ── Storage / usage dashboard schemas ───────────────────────────────────────────
+
+class ProjectStorageResponse(BaseModel):
+    project_id: uuid.UUID
+    name: str
+    bytes: int
+    bytes_human: str
+    asset_count: int
+    version_count: int
+
+
+class StorageSummaryResponse(BaseModel):
+    total_bytes: int
+    total_human: str
+    project_count: int
+    projects: list[ProjectStorageResponse]
+
+
+def _human_bytes(num: int) -> str:
+    """Render a byte count as a human-readable string (binary units)."""
+    value = float(num or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(value) < 1024.0 or unit == "PB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} PB"
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -109,3 +143,63 @@ def update_user_role(
     db.commit()
     db.refresh(user)
     return user
+
+
+@router.get("/storage", response_model=StorageSummaryResponse)
+def get_storage_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-project B2 storage breakdown (billed per GB). Superadmin only.
+
+    Aggregates media_files.file_size_bytes grouped by project in a SINGLE
+    query (media_files -> asset_versions -> assets -> projects). Soft-deleted
+    versions, assets, and projects are excluded consistently; media_files has
+    no soft-delete column, so it inherits exclusion from its parent version.
+    """
+    if not current_user.is_superadmin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can access this endpoint"
+        )
+
+    rows = (
+        db.query(
+            Project.id.label("project_id"),
+            Project.name.label("name"),
+            func.coalesce(func.sum(MediaFile.file_size_bytes), 0).label("bytes"),
+            func.count(distinct(Asset.id)).label("asset_count"),
+            func.count(distinct(AssetVersion.id)).label("version_count"),
+        )
+        .join(Asset, Asset.project_id == Project.id)
+        .join(AssetVersion, AssetVersion.asset_id == Asset.id)
+        .join(MediaFile, MediaFile.version_id == AssetVersion.id)
+        .filter(
+            Project.deleted_at.is_(None),
+            Asset.deleted_at.is_(None),
+            AssetVersion.deleted_at.is_(None),
+        )
+        .group_by(Project.id, Project.name)
+        .order_by(func.coalesce(func.sum(MediaFile.file_size_bytes), 0).desc())
+        .all()
+    )
+
+    projects = [
+        ProjectStorageResponse(
+            project_id=r.project_id,
+            name=r.name,
+            bytes=int(r.bytes or 0),
+            bytes_human=_human_bytes(int(r.bytes or 0)),
+            asset_count=int(r.asset_count or 0),
+            version_count=int(r.version_count or 0),
+        )
+        for r in rows
+    ]
+
+    total_bytes = sum(p.bytes for p in projects)
+    return StorageSummaryResponse(
+        total_bytes=total_bytes,
+        total_human=_human_bytes(total_bytes),
+        project_count=len(projects),
+        projects=projects,
+    )
