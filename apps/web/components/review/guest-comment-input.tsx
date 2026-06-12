@@ -12,14 +12,25 @@ interface GuestIdentity {
   name: string
 }
 
-const STORAGE_KEY = 'cadence_guest_identity'
+// Canonical key the ReviewProvider reads guest identity from. Older builds wrote
+// to `cadence_guest_identity`; we migrate that on read so existing guests don't
+// have to re-enter their name/email.
+const STORAGE_KEY = 'ff_guest_identity'
+const LEGACY_STORAGE_KEY = 'cadence_guest_identity'
 
 function loadIdentity(): GuestIdentity | null {
   if (typeof window === 'undefined') return null
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    return JSON.parse(raw) as GuestIdentity
+    if (raw) return JSON.parse(raw) as GuestIdentity
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY)
+    if (legacy) {
+      // Migrate to the canonical key, then drop the legacy copy.
+      localStorage.setItem(STORAGE_KEY, legacy)
+      localStorage.removeItem(LEGACY_STORAGE_KEY)
+      return JSON.parse(legacy) as GuestIdentity
+    }
+    return null
   } catch {
     return null
   }
@@ -33,6 +44,7 @@ function saveIdentity(identity: GuestIdentity) {
 function clearIdentity() {
   if (typeof window === 'undefined') return
   localStorage.removeItem(STORAGE_KEY)
+  localStorage.removeItem(LEGACY_STORAGE_KEY)
 }
 
 // ─── Identity form ────────────────────────────────────────────────────────────
