@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -32,7 +32,13 @@ from ..schemas.comment import (
     ReactionResponse,
 )
 from ..services import s3_service
-from ..services.permissions import require_asset_access, validate_share_link
+from ..services.permissions import (
+    get_asset_share_permission,
+    get_project_member,
+    require_asset_access,
+    require_project_role,
+    validate_share_link_with_session,
+)
 from ..tasks.email_tasks import send_mention_email, send_comment_email
 from ..tasks.celery_app import send_task_safe
 
@@ -53,6 +59,31 @@ def _get_comment(db: Session, comment_id: uuid.UUID) -> Comment:
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
     return comment
+
+
+def _require_comment_write_access(db: Session, asset: Asset, user: User) -> None:
+    """Gate comment write/resolve actions behind a minimum capability.
+
+    A project member needs at least the `reviewer` role; a viewer is read-only.
+    A non-member who reaches the asset via a direct share needs at least
+    `comment` permission. Read access (require_asset_access) stays open to all.
+    """
+    PERM_RANK = {
+        SharePermission.approve: 3,
+        SharePermission.comment: 2,
+        SharePermission.view: 1,
+    }
+    # Asset creator always retains write access.
+    if asset.created_by == user.id:
+        return
+    member = get_project_member(db, asset.project_id, user.id)
+    if member:
+        require_project_role(db, asset.project_id, user, ProjectRole.reviewer)
+        return
+    # Non-member: must hold at least `comment` permission via a direct share
+    permission = get_asset_share_permission(db, asset, user)
+    if PERM_RANK[permission] < PERM_RANK[SharePermission.comment]:
+        raise HTTPException(status_code=403, detail="You do not have permission to comment")
 
 
 def _build_attachment_response(attachment: CommentAttachment) -> AttachmentResponse:
@@ -142,6 +173,102 @@ def _get_annotations_map(comment_ids: list[uuid.UUID], db: Session) -> dict:
     return {a.comment_id: a for a in annotations}
 
 
+def _build_comment_tree_batched(
+    top_level: list[Comment],
+    all_comments: list[Comment],
+    db: Session,
+    current_user_id: uuid.UUID | None = None,
+    depth: int = 5,
+) -> list[CommentResponse]:
+    """Build the full comment tree for `top_level` using a fixed number of
+    batched queries instead of the per-comment recursion in
+    `_build_comment_response`. Produces the identical response shape.
+
+    `all_comments` must contain every non-deleted comment for the asset
+    (top-level + replies) so the reply tree can be assembled in memory.
+    """
+    # Index replies by parent so the tree assembles without per-node queries.
+    children_by_parent: dict[uuid.UUID, list[Comment]] = defaultdict(list)
+    for c in all_comments:
+        if c.parent_id is not None:
+            children_by_parent[c.parent_id].append(c)
+    for kids in children_by_parent.values():
+        kids.sort(key=lambda c: c.created_at)
+
+    # Collect every comment id that will appear in the output (respecting depth).
+    included: list[Comment] = []
+    seen: set[uuid.UUID] = set()
+
+    def _collect(comment: Comment, remaining: int) -> None:
+        if comment.id in seen:
+            return
+        seen.add(comment.id)
+        included.append(comment)
+        if remaining > 0:
+            for child in children_by_parent.get(comment.id, []):
+                _collect(child, remaining - 1)
+
+    for c in top_level:
+        _collect(c, depth)
+
+    comment_ids = [c.id for c in included]
+
+    # ── Batch-load all related rows in a handful of queries ──
+    annotations_map = _get_annotations_map(comment_ids, db)
+
+    attachments_by_comment: dict[uuid.UUID, list[CommentAttachment]] = defaultdict(list)
+    reactions_by_comment: dict[uuid.UUID, list[CommentReaction]] = defaultdict(list)
+    if comment_ids:
+        for a in db.query(CommentAttachment).filter(
+            CommentAttachment.comment_id.in_(comment_ids)
+        ).all():
+            attachments_by_comment[a.comment_id].append(a)
+        for r in db.query(CommentReaction).filter(
+            CommentReaction.comment_id.in_(comment_ids)
+        ).all():
+            reactions_by_comment[r.comment_id].append(r)
+
+    author_ids = {c.author_id for c in included if c.author_id}
+    guest_ids = {c.guest_author_id for c in included if c.guest_author_id}
+    authors_map = {
+        u.id: u for u in db.query(User).filter(User.id.in_(author_ids)).all()
+    } if author_ids else {}
+    guests_map = {
+        g.id: g for g in db.query(GuestUser).filter(GuestUser.id.in_(guest_ids)).all()
+    } if guest_ids else {}
+
+    def _build(comment: Comment, remaining: int) -> CommentResponse:
+        author_info = None
+        if comment.author_id and comment.author_id in authors_map:
+            author = authors_map[comment.author_id]
+            author_info = AuthorInfo(id=author.id, name=author.name, avatar_url=author.avatar_url)
+
+        guest_author_info = None
+        if comment.guest_author_id and comment.guest_author_id in guests_map:
+            guest = guests_map[comment.guest_author_id]
+            guest_author_info = GuestAuthorInfo(id=guest.id, name=guest.name, email=guest.email)
+
+        annotation = annotations_map.get(comment.id)
+
+        resp = CommentResponse.model_validate(comment)
+        resp.author = author_info
+        resp.guest_author = guest_author_info
+        resp.annotation = AnnotationResponse.model_validate(annotation) if annotation else None
+        resp.replies = [
+            _build(child, remaining - 1)
+            for child in children_by_parent.get(comment.id, [])
+        ] if remaining > 0 else []
+        resp.attachments = [
+            _build_attachment_response(a) for a in attachments_by_comment.get(comment.id, [])
+        ]
+        resp.reactions = _build_reaction_responses(
+            reactions_by_comment.get(comment.id, []), current_user_id
+        )
+        return resp
+
+    return [_build(c, depth) for c in top_level]
+
+
 def _parse_mentions(body: str) -> list[str]:
     """Extract @email mentions from comment body."""
     return re.findall(r"@([\w.+-]+@[\w.-]+\.\w+)", body)
@@ -202,18 +329,23 @@ def list_comments(
 ):
     asset = _get_asset(db, asset_id)
     require_asset_access(db, asset, current_user)
-    # Top-level comments only (parent_id is None)
-    query = db.query(Comment).filter(
+    # Load every non-deleted comment for this asset in ONE query, then split into
+    # top-level + replies in memory to avoid the per-comment recursive N+1.
+    all_query = db.query(Comment).filter(
         Comment.asset_id == asset_id,
-        Comment.parent_id.is_(None),
         Comment.deleted_at.is_(None),
     )
     if version_id:
-        query = query.filter(Comment.version_id == version_id)
+        all_query = all_query.filter(Comment.version_id == version_id)
+    all_comments = all_query.order_by(Comment.created_at).all()
+
+    top_level = [c for c in all_comments if c.parent_id is None]
     if visibility and visibility in ("public", "internal"):
-        query = query.filter(Comment.visibility == visibility)
-    top_level = query.order_by(Comment.created_at).all()
-    return [_build_comment_response(c, db, current_user_id=current_user.id) for c in top_level]
+        top_level = [c for c in top_level if c.visibility == visibility]
+
+    return _build_comment_tree_batched(
+        top_level, all_comments, db, current_user_id=current_user.id
+    )
 
 
 @router.post("/assets/{asset_id}/comments", response_model=CommentResponse, status_code=status.HTTP_201_CREATED)
@@ -224,7 +356,7 @@ def create_comment(
     current_user: User = Depends(get_current_user),
 ):
     asset = _get_asset(db, asset_id)
-    require_asset_access(db, asset, current_user)
+    _require_comment_write_access(db, asset, current_user)
 
     comment = Comment(
         asset_id=asset_id,
@@ -277,7 +409,7 @@ def reply_to_comment(
     current_user: User = Depends(get_current_user),
 ):
     asset = _get_asset(db, asset_id)
-    require_asset_access(db, asset, current_user)
+    _require_comment_write_access(db, asset, current_user)
     parent = db.query(Comment).filter(Comment.id == comment_id, Comment.deleted_at.is_(None)).first()
     if not parent:
         raise HTTPException(status_code=404, detail="Parent comment not found")
@@ -370,7 +502,7 @@ def resolve_comment(
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
     asset = _get_asset(db, comment.asset_id)
-    require_asset_access(db, asset, current_user)
+    _require_comment_write_access(db, asset, current_user)
     comment.resolved = not comment.resolved
     db.commit()
     db.refresh(comment)
@@ -478,7 +610,7 @@ def toggle_reaction(
 ):
     comment = _get_comment(db, comment_id)
     asset = _get_asset(db, comment.asset_id)
-    require_asset_access(db, asset, current_user)
+    _require_comment_write_access(db, asset, current_user)
 
     existing = db.query(CommentReaction).filter(
         CommentReaction.comment_id == comment_id,
@@ -545,11 +677,16 @@ def comment_deep_link(
 def list_share_comments(
     token: str,
     asset_id: Optional[uuid.UUID] = None,
+    share_session: Optional[str] = Query(None, alias="share_session"),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
-    """Public endpoint — list comments for a shared asset. No auth required.
+    """Public endpoint — list comments for a shared asset. Optional auth.
+    Enforces secure + password-protected links via the session-aware validator.
     For folder/project shares, pass asset_id as query param to get comments for a specific asset."""
-    link = validate_share_link(db, token)
+    link = validate_share_link_with_session(
+        db, token, share_session=share_session, current_user=current_user
+    )
 
     # Determine the asset_id to list comments for
     target_asset_id = link.asset_id or asset_id
@@ -557,24 +694,29 @@ def list_share_comments(
         return {"comments": []}
     asset_id = target_asset_id
 
-    # Get top-level comments — reuse same format as authenticated endpoint
-    top_level = db.query(Comment).filter(
+    # External reviewers must never see internal/team-only comments. Load only
+    # public-visibility comments (top-level + replies) and build the tree.
+    all_comments = db.query(Comment).filter(
         Comment.asset_id == asset_id,
-        Comment.parent_id.is_(None),
         Comment.deleted_at.is_(None),
+        Comment.visibility == "public",
     ).order_by(Comment.created_at).all()
 
-    return [_build_comment_response(c, db) for c in top_level]
+    top_level = [c for c in all_comments if c.parent_id is None]
+    return _build_comment_tree_batched(top_level, all_comments, db)
 
 
 @router.post("/share/{token}/comment", response_model=CommentResponse, status_code=status.HTTP_201_CREATED)
 def guest_comment(
     token: str,
     body: GuestCommentCreate,
+    share_session: Optional[str] = Query(None, alias="share_session"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
-    link = validate_share_link(db, token)
+    link = validate_share_link_with_session(
+        db, token, share_session=share_session, current_user=current_user
+    )
 
     # Check share link permission allows commenting
     if link.permission == SharePermission.view:

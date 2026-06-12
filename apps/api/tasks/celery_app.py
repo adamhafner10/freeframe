@@ -17,6 +17,7 @@ celery_app = Celery(
         "apps.api.tasks.watermark_tasks",
         "apps.api.tasks.reminder_tasks",
         "apps.api.tasks.email_tasks",
+        "apps.api.tasks.cleanup_tasks",
     ],
 )
 
@@ -64,6 +65,10 @@ celery_app.conf.beat_schedule = {
     "cleanup-stuck-uploads": {
         "task": "cleanup_stuck_uploads",
         "schedule": crontab(minute="*/5"),  # every 5 minutes
+    },
+    "reap-deleted-assets": {
+        "task": "reap_deleted_assets",
+        "schedule": crontab(minute="0", hour="3"),  # daily at 03:00 UTC
     },
 }
 

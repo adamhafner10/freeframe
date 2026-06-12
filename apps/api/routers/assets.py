@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import os
@@ -108,8 +108,11 @@ def _build_asset_responses_bulk(assets: list[Asset], db: Session) -> list[AssetR
 @router.get("/projects/{project_id}/assets", response_model=list[AssetResponse])
 def list_assets(
     project_id: uuid.UUID,
+    response: Response,
     include_failed: bool = Query(False, description="Include assets whose latest version failed processing"),
     folder_id: Optional[str] = Query(None, description="Filter by folder. 'root' for root level, UUID for specific folder."),
+    limit: int = Query(50, ge=1, le=200, description="Max assets per page (1-200)."),
+    offset: int = Query(0, ge=0, description="Number of assets to skip for pagination."),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -128,28 +131,47 @@ def list_assets(
     elif folder_id is not None:
         query = query.filter(Asset.folder_id == uuid.UUID(folder_id))
 
-    assets = query.all()
-
     if not include_failed:
-        # Exclude assets where the only version is failed or still uploading
-        asset_ids = [a.id for a in assets]
-        if asset_ids:
-            # Find assets that have at least one non-failed, non-uploading version
-            usable = set(
-                row[0] for row in db.query(AssetVersion.asset_id).filter(
-                    AssetVersion.asset_id.in_(asset_ids),
-                    AssetVersion.deleted_at.is_(None),
-                    AssetVersion.processing_status.notin_([ProcessingStatus.failed, ProcessingStatus.uploading]),
-                ).distinct().all()
+        # Exclude assets whose only versions are failed or still uploading, but
+        # keep assets that have no versions yet (just created). Push this into
+        # the SQL so pagination + total count operate on the final result set
+        # instead of materializing every asset in the project.
+        usable_subq = (
+            db.query(AssetVersion.asset_id)
+            .filter(
+                AssetVersion.asset_id == Asset.id,
+                AssetVersion.deleted_at.is_(None),
+                AssetVersion.processing_status.notin_([ProcessingStatus.failed, ProcessingStatus.uploading]),
             )
-            # Also include assets with no versions yet (just created)
-            has_any_version = set(
-                row[0] for row in db.query(AssetVersion.asset_id).filter(
-                    AssetVersion.asset_id.in_(asset_ids),
-                    AssetVersion.deleted_at.is_(None),
-                ).distinct().all()
+            .exists()
+        )
+        has_any_version_subq = (
+            db.query(AssetVersion.asset_id)
+            .filter(
+                AssetVersion.asset_id == Asset.id,
+                AssetVersion.deleted_at.is_(None),
             )
-            assets = [a for a in assets if a.id in usable or a.id not in has_any_version]
+            .exists()
+        )
+        query = query.filter(usable_subq | ~has_any_version_subq)
+
+    # Total before pagination so the client can size the pager.
+    total = query.with_entities(func.count(Asset.id)).scalar() or 0
+
+    # Stable ordering + page slice BEFORE building responses, so only the
+    # page's assets get presigned (presigning happens in the bulk builder).
+    assets = (
+        query.order_by(Asset.created_at.desc(), Asset.id.desc())
+        .limit(limit)
+        .offset(offset)
+        .all()
+    )
+
+    # Backward-compatible: body stays a plain array; pagination metadata rides
+    # along in response headers (the web client consumes the array as-is).
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
 
     return _build_asset_responses_bulk(assets, db)
 

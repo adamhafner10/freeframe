@@ -134,8 +134,18 @@ def validate_share_link_with_session(
     current_user: "User | None" = None,
 ) -> ShareLink:
     """Validate a share link and verify password session if link is password-protected.
-    Skips password check if the caller is the authenticated link creator."""
+    Skips password check if the caller is the authenticated link creator.
+
+    Also enforces `visibility == 'secure'` links, which require an authenticated
+    user (any logged-in account) before content is served."""
     link = validate_share_link(db, token)
+    # Secure links require an authenticated user — skip for the link creator path
+    # below (the creator is always authenticated and handled by password skip too).
+    if link.visibility == "secure" and not current_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
     if link.password_hash:
         # Skip password for authenticated link creator (e.g. admin settings preview)
         if current_user and link.created_by == current_user.id:
