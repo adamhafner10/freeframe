@@ -45,15 +45,17 @@ export default function StoragePage() {
     }
   }, [user, isSuperAdmin, router]);
 
-  if (!isSuperAdmin) {
-    return null;
-  }
-
-  // Sort projects by bytes desc; compute proportional bars off the largest project.
+  // Sort projects by bytes desc; compute proportional bars off the largest
+  // project. Kept above the early return so the hook order stays stable when
+  // isSuperAdmin resolves (React rules-of-hooks).
   const projects = React.useMemo(() => {
     if (!data?.projects) return [];
     return [...data.projects].sort((a, b) => b.bytes - a.bytes);
   }, [data]);
+
+  if (!isSuperAdmin) {
+    return null;
+  }
 
   const maxBytes = projects.length > 0 ? Math.max(projects[0].bytes, 1) : 1;
 
