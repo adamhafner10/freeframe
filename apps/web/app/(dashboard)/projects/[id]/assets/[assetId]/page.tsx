@@ -28,6 +28,8 @@ import {
   Loader2,
   Columns2,
   Upload,
+  AlertTriangle,
+  RotateCcw,
 } from 'lucide-react'
 import Link from 'next/link'
 import { cn } from '@/lib/utils'
@@ -40,6 +42,13 @@ const acceptByType: Record<string, string> = {
   image: 'image/*',
   image_carousel: 'image/*',
 }
+
+/**
+ * Transcode (HLS) status from the backend's AssetVersionResponse. Read off the
+ * current version via a narrow cast until `hls_status` lands on the shared
+ * AssetVersion type in types/index.ts.
+ */
+type HlsStatus = 'pending' | 'processing' | 'ready' | 'failed'
 
 function ReviewScreenInner({ projectId }: { projectId: string }) {
   const router = useRouter()
@@ -55,6 +64,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const [annotationData, setAnnotationData] = useState<Record<string, unknown> | null>(null)
   const [activeTab, setActiveTab] = useState<'comments' | 'fields'>('comments')
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [retryingTranscode, setRetryingTranscode] = useState(false)
   const deepLinkApplied = useRef(false)
 
   // Fetch folder tree to build the folder path for the breadcrumb
@@ -212,6 +222,24 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const versionProcessing =
     currentVersion?.processing_status === 'processing' ||
     currentVersion?.processing_status === 'uploading'
+
+  // Transcode (HLS) state for the current version — read via cast until
+  // `hls_status` lands on the shared AssetVersion type.
+  const hlsStatus = (currentVersion as { hls_status?: HlsStatus } | null)?.hls_status ?? null
+  const canRetryTranscode = currentRole === 'owner' || currentRole === 'editor'
+
+  const handleRetryTranscode = async () => {
+    if (!asset || !currentVersion || retryingTranscode) return
+    setRetryingTranscode(true)
+    try {
+      await api.post(`/assets/${asset.id}/versions/${currentVersion.id}/retry`)
+      await refetchVersions()
+    } catch {
+      // Backend governs (e.g. 403); surface nothing destructive here.
+    } finally {
+      setRetryingTranscode(false)
+    }
+  }
 
   const renderMediaViewer = () => {
     if (!currentVersion || !versionReady) {
@@ -374,6 +402,37 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
               setTimeout(() => refetchVersions(), 800)
             }}
           />
+          {/* Transcode status + retry for the current version */}
+          {hlsStatus && hlsStatus !== 'ready' && (
+            <>
+              {hlsStatus === 'failed' ? (
+                <span className="inline-flex items-center gap-1.5 rounded-md px-2 h-8 text-xs font-medium bg-status-error/10 text-status-error">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  Transcode failed
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-md px-2 h-8 text-xs font-medium bg-status-warning/10 text-status-warning">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Processing
+                </span>
+              )}
+              {hlsStatus === 'failed' && canRetryTranscode && (
+                <button
+                  onClick={handleRetryTranscode}
+                  disabled={retryingTranscode}
+                  className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors disabled:opacity-60"
+                  title="Retry transcode"
+                >
+                  {retryingTranscode ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-3.5 w-3.5" />
+                  )}
+                  Retry
+                </button>
+              )}
+            </>
+          )}
           <VersionSwitcher versions={versions} />
           <button
             onClick={() => versionFileInputRef.current?.click()}

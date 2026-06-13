@@ -54,6 +54,8 @@ import { usePageTitle } from "@/hooks/use-page-title";
 import type {
   Project,
   AssetResponse,
+  AssetVersion,
+  AssetVersionStatus,
   ProjectMember,
   User,
   Folder,
@@ -228,6 +230,24 @@ export default function ProjectDetailPage() {
     return map;
   }, [assets]);
 
+  const hlsStatuses = React.useMemo(() => {
+    if (!assets) return {};
+    const map: Record<string, NonNullable<AssetVersion["hls_status"]>> = {};
+    for (const a of assets) {
+      if (a.latest_version?.hls_status) map[a.id] = a.latest_version.hls_status;
+    }
+    return map;
+  }, [assets]);
+
+  const processingStatuses = React.useMemo(() => {
+    if (!assets) return {};
+    const map: Record<string, AssetVersionStatus> = {};
+    for (const a of assets) {
+      if (a.latest_version) map[a.id] = a.latest_version.processing_status;
+    }
+    return map;
+  }, [assets]);
+
   const fileSizes = React.useMemo(() => {
     if (!assets) return {};
     const map: Record<string, number> = {};
@@ -294,6 +314,21 @@ export default function ProjectDetailPage() {
   const canManageMembers = currentRole === "owner";
   const canSeeShareLinks = currentRole === "owner" || currentRole === "editor";
   const canComment = currentRole !== "viewer";
+
+  const handleRetryTranscode = React.useCallback(
+    async (asset: { id: string }) => {
+      const full = assets?.find((a) => a.id === asset.id);
+      const versionId = full?.latest_version?.id;
+      if (!versionId) return;
+      try {
+        await api.post(`/assets/${asset.id}/versions/${versionId}/retry`, {});
+        await mutateAssets();
+      } catch {
+        /* failure is surfaced by the backend (e.g. 403); nothing to do here */
+      }
+    },
+    [assets, mutateAssets],
+  );
 
   function openShareDialog(assetIds: string[], folderIds: string[]) {
     if (folderIds.length === 1 && assetIds.length === 0) {
@@ -727,6 +762,10 @@ export default function ProjectDetailPage() {
               assignees={assigneesMap}
               thumbnails={thumbnails}
               versionCounts={versionCounts}
+              hlsStatuses={hlsStatuses}
+              processingStatuses={processingStatuses}
+              canRetryTranscode={canUpload}
+              onRetryTranscode={handleRetryTranscode}
               authorNames={authorNames}
               fileSizes={fileSizes}
               selectedAssetId={selectedAsset?.id}

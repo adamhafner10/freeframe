@@ -21,7 +21,14 @@ class Approval(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     asset_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("assets.id"), nullable=False, index=True)
     version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("asset_versions.id"), nullable=False, index=True)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    # Nullable so guest approvals (made through a share link, no account) can be
+    # recorded. The (version_id, user_id) unique constraint stays — NULL user_ids
+    # are distinct in Postgres, so guest rows never collide with it.
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    # Guest identity captured from the share viewer when there's no authenticated
+    # user. Both NULL for member approvals (user_id is set instead).
+    guest_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    guest_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[ApprovalStatus] = mapped_column(Enum(ApprovalStatus), default=ApprovalStatus.pending)
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

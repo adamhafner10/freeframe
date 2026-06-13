@@ -13,7 +13,8 @@ import { AppearancePopover } from './appearance-popover'
 import { SortPopover } from './sort-popover'
 import { MoveToDialog } from './move-to-dialog'
 import { useViewStore } from '@/stores/view-store'
-import type { Asset, AssetStatus, User, Folder, FolderTreeNode } from '@/types'
+import type { Asset, AssetStatus, AssetVersionStatus, User, Folder, FolderTreeNode } from '@/types'
+import type { HlsStatus } from './asset-card'
 
 const assetTypeIcons: Record<string, React.ElementType> = {
   video: Film,
@@ -39,6 +40,14 @@ interface AssetGridProps {
   versionCounts?: Record<string, number>
   authorNames?: Record<string, string>
   fileSizes?: Record<string, number>
+  /** Per-asset transcode (HLS) status keyed by asset id */
+  hlsStatuses?: Record<string, HlsStatus>
+  /** Per-asset version processing status keyed by asset id */
+  processingStatuses?: Record<string, AssetVersionStatus>
+  /** Whether the current user can retry a failed transcode (editor+) */
+  canRetryTranscode?: boolean
+  /** Re-enqueue a failed/missing HLS transcode for an asset's latest version */
+  onRetryTranscode?: (asset: Asset) => Promise<void> | void
   selectedAssetId?: string | null
   onUpload?: () => void
   onAssetSelect?: (asset: Asset, e?: React.MouseEvent) => void
@@ -91,6 +100,10 @@ export function AssetGrid({
   versionCounts = {},
   authorNames = {},
   fileSizes = {},
+  hlsStatuses = {},
+  processingStatuses = {},
+  canRetryTranscode = false,
+  onRetryTranscode,
   selectedAssetId,
   onUpload,
   onAssetSelect,
@@ -346,6 +359,10 @@ export function AssetGrid({
                 authorName={authorNames[asset.created_by]}
                 thumbnailUrl={thumbnails[asset.id]}
                 fileSize={fileSizes[asset.id] ?? null}
+                hlsStatus={hlsStatuses[asset.id] ?? null}
+                processingStatus={processingStatuses[asset.id] ?? null}
+                canRetry={canRetryTranscode}
+                onRetryTranscode={onRetryTranscode ? () => onRetryTranscode(asset) : undefined}
                 selected={selectedAssetIds.has(asset.id)}
                 onSelect={() => toggleAssetSelect(asset.id)}
                 showInfo={showCardInfo}
