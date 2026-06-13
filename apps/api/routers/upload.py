@@ -1,5 +1,6 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import uuid
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from ..models.project import Project
 from ..services.s3_service import (
     create_multipart_upload, presign_upload_part,
     complete_multipart_upload, abort_multipart_upload,
+    list_multipart_parts,
 )
 from ..services.permissions import get_project_member, require_project_role
 from ..models.project import ProjectRole
@@ -104,6 +106,46 @@ def initiate_upload(
     )
 
 
+# --- Batch presign + resume schemas (inline; this router owns them) ---
+
+class PresignPartsBatchRequest(BaseModel):
+    s3_key: str
+    upload_id: str
+    part_numbers: list[int]  # 1-indexed part numbers to presign in one round-trip
+
+class PresignedPart(BaseModel):
+    part_number: int
+    url: str
+
+class PresignPartsBatchResponse(BaseModel):
+    parts: list[PresignedPart]
+
+class ListPartsRequest(BaseModel):
+    s3_key: str
+    upload_id: str
+
+class ListedPart(BaseModel):
+    part_number: int
+    etag: str
+
+class ListPartsResponse(BaseModel):
+    parts: list[ListedPart]
+
+
+def _verify_upload_owner(db: Session, s3_key: str, current_user: User) -> AssetVersion:
+    """Verify the s3_key belongs to an upload initiated by this user.
+
+    Returns the owning AssetVersion or raises 404/403.
+    """
+    media_file = db.query(MediaFile).filter(MediaFile.s3_key_raw == s3_key).first()
+    if not media_file:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    version = db.query(AssetVersion).filter(AssetVersion.id == media_file.version_id).first()
+    if not version or version.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized for this upload")
+    return version
+
+
 @router.post("/presign-part", response_model=PresignPartResponse)
 def presign_part(
     body: PresignPartRequest,
@@ -113,16 +155,60 @@ def presign_part(
     if body.part_number < 1 or body.part_number > 10000:
         raise HTTPException(status_code=400, detail="Part number must be between 1 and 10000")
 
-    # Verify the s3_key belongs to an upload initiated by this user
-    media_file = db.query(MediaFile).filter(MediaFile.s3_key_raw == body.s3_key).first()
-    if not media_file:
-        raise HTTPException(status_code=404, detail="Upload not found")
-    version = db.query(AssetVersion).filter(AssetVersion.id == media_file.version_id).first()
-    if not version or version.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized for this upload")
+    _verify_upload_owner(db, body.s3_key, current_user)
 
     url = presign_upload_part(body.s3_key, body.upload_id, body.part_number)
     return PresignPartResponse(presigned_url=url, part_number=body.part_number)
+
+
+@router.post("/presign-parts", response_model=PresignPartsBatchResponse)
+def presign_parts_batch(
+    body: PresignPartsBatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Presign a LIST of part numbers in a single round-trip.
+
+    Replaces N sequential /presign-part calls (one per ~10MB chunk) with one
+    request for the whole upload, so the client can fan out parallel PUTs
+    without a presign latency tax per part.
+    """
+    if not body.part_numbers:
+        raise HTTPException(status_code=400, detail="part_numbers must not be empty")
+    if len(body.part_numbers) > 10000:
+        raise HTTPException(status_code=400, detail="Too many parts (max 10000)")
+    if any(n < 1 or n > 10000 for n in body.part_numbers):
+        raise HTTPException(status_code=400, detail="Part number must be between 1 and 10000")
+
+    _verify_upload_owner(db, body.s3_key, current_user)
+
+    parts = [
+        PresignedPart(
+            part_number=n,
+            url=presign_upload_part(body.s3_key, body.upload_id, n),
+        )
+        for n in body.part_numbers
+    ]
+    return PresignPartsBatchResponse(parts=parts)
+
+
+@router.post("/list-parts", response_model=ListPartsResponse)
+def list_parts(
+    body: ListPartsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List parts already uploaded to B2/S3 for an in-progress multipart upload.
+
+    The client calls this when RESUMING a previously-failed/interrupted upload
+    so it can skip parts that already landed instead of re-PUTting them.
+    """
+    _verify_upload_owner(db, body.s3_key, current_user)
+
+    parts = list_multipart_parts(body.s3_key, body.upload_id)
+    return ListPartsResponse(
+        parts=[ListedPart(part_number=p["PartNumber"], etag=p["ETag"]) for p in parts]
+    )
 
 
 @router.post("/complete", response_model=CompleteUploadResponse)

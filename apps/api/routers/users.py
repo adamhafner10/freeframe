@@ -8,9 +8,12 @@ from ..schemas.auth import UserResponse, InviteRequest, UpdateProfileRequest
 from ..models.user import User, UserStatus
 from ..middleware.auth import get_current_user
 from ..services.auth_service import hash_password, get_user_by_email
-from ..tasks.email_tasks import send_invite_email
-from ..tasks.celery_app import send_task_safe
+from ..services.email_service import email_service
 from ..config import settings
+
+# Invite tokens are valid for this many days. Kept as a constant so the DB
+# expiry and the value rendered into the email stay in lock-step.
+INVITE_EXPIRY_DAYS = 7
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -58,8 +61,8 @@ def invite_user(body: InviteRequest, db: Session = Depends(get_db), current_user
     
     # Generate invite token
     invite_token = secrets.token_urlsafe(48)
-    invite_expires = datetime.now(timezone.utc) + timedelta(days=7)
-    
+    invite_expires = datetime.now(timezone.utc) + timedelta(days=INVITE_EXPIRY_DAYS)
+
     user = User(
         email=body.email,
         name=body.name,
@@ -70,11 +73,71 @@ def invite_user(body: InviteRequest, db: Session = Depends(get_db), current_user
     db.add(user)
     db.commit()
     db.refresh(user)
-    
-    # Send invite email
+
+    # Send the invite email SYNCHRONOUSLY. The invite token lives ONLY in this
+    # email (no resend-on-dispatch, no token in the 201 body), so a swallowed
+    # broker/publish error would silently lock the invitee out forever while the
+    # API reported success. If the send fails we roll back the just-created
+    # pending user and return 503 so a retry is clean (no "already registered"
+    # ghost user blocking a re-invite).
     invite_url = f"{settings.frontend_url}/invite/{invite_token}"
-    send_task_safe(send_invite_email, user.email, current_user.name or "Admin", "FileStream", invite_url)
-    
+    try:
+        email_service.send_invite_email_sync(
+            user.email,
+            current_user.name or "Admin",
+            "FileStream",
+            invite_url,
+            expiry_days=INVITE_EXPIRY_DAYS,
+        )
+    except Exception:
+        db.delete(user)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to send the invite email right now. Please try again in a moment.",
+        )
+
+    return user
+
+
+@router.post("/{user_id}/resend-invite", response_model=UserResponse)
+def resend_invite(user_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
+    """Regenerate the invite token for a still-pending user and re-send it.
+
+    The invite token only ever exists in the delivered email; if that first send
+    is lost there is otherwise no way to recover (re-inviting hits "already
+    registered"). This endpoint mints a fresh token + expiry and re-sends
+    synchronously so a failed delivery surfaces as a 503 the admin can retry.
+    """
+    user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.status != UserStatus.pending_invite:
+        raise HTTPException(status_code=400, detail="User is not pending an invite")
+
+    # Mint a fresh token so the previous (possibly leaked or undelivered) one is
+    # invalidated, and persist before sending so the link in the email is valid.
+    new_token = secrets.token_urlsafe(48)
+    user.invite_token = new_token
+    user.invite_token_expires_at = datetime.now(timezone.utc) + timedelta(days=INVITE_EXPIRY_DAYS)
+    db.commit()
+    db.refresh(user)
+
+    invite_url = f"{settings.frontend_url}/invite/{new_token}"
+    try:
+        email_service.send_invite_email_sync(
+            user.email,
+            current_user.name or "Admin",
+            "FileStream",
+            invite_url,
+            expiry_days=INVITE_EXPIRY_DAYS,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to send the invite email right now. Please try again in a moment.",
+        )
+
     return user
 
 @router.patch("/{user_id}", response_model=UserResponse)

@@ -3,7 +3,17 @@ import { persist } from 'zustand/middleware'
 import { api } from '@/lib/api'
 import type { AssetResponse } from '@/types'
 
-const CHUNK_SIZE = 10 * 1024 * 1024 // 10 MB
+// Part size for multipart upload. Bigger parts = fewer parts = fewer round-trips
+// (presign + PUT) per upload. B2/S3 cap multipart at 10000 parts, so 64MB keeps
+// even a 10GB file (~160 parts) well under the limit. MUST stay >= 5MB (S3 min
+// part size for non-final parts).
+const CHUNK_SIZE = 64 * 1024 * 1024 // 64 MB
+// Number of parts uploaded in parallel. Drains a shared worklist of part numbers.
+const UPLOAD_CONCURRENCY = 5
+// Per-part PUT retry policy (exponential backoff). A single transient failure no
+// longer aborts the whole upload.
+const PART_MAX_ATTEMPTS = 4
+const PART_RETRY_BASE_MS = 500
 const HISTORY_PAGE_SIZE = 20
 
 export type UploadStatus = 'pending' | 'uploading' | 'processing' | 'complete' | 'failed' | 'cancelled'
@@ -44,6 +54,145 @@ interface VersionInitiateResponse {
 
 // AbortControllers for cancellation
 const abortControllers: Record<string, AbortController> = {}
+
+interface CompletedPart {
+  PartNumber: number
+  ETag: string
+}
+
+interface BatchPresignResponse {
+  parts: Array<{ part_number: number; url: string }>
+}
+
+interface ListPartsResponse {
+  parts: Array<{ part_number: number; etag: string }>
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+/**
+ * Upload all parts of a file to B2/S3 with bounded concurrency, per-part retry,
+ * and resume. Shared by the new-asset and new-version paths.
+ *
+ *  - Presigns every part up front in ONE batch request (no per-part round-trip).
+ *  - Calls list-parts to skip parts that already landed (resume an interrupted
+ *    upload instead of re-PUTting gigabytes).
+ *  - Runs UPLOAD_CONCURRENCY workers draining a shared part-number worklist.
+ *  - Each part PUT retries with exponential backoff (PART_MAX_ATTEMPTS).
+ *  - A single AbortController (signal) aborts ALL in-flight parts on cancel.
+ *
+ * Returns the full {PartNumber, ETag} list (already-uploaded + freshly uploaded)
+ * sorted by part number, ready for /upload/complete.
+ */
+async function uploadParts(opts: {
+  file: File
+  s3Key: string
+  uploadId: string
+  signal: AbortSignal
+  onProgress: (uploadedBytes: number) => void
+}): Promise<CompletedPart[]> {
+  const { file, s3Key, uploadId, signal, onProgress } = opts
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+
+  // 1. Resume: find parts already uploaded so we can skip them.
+  const etagByPart = new Map<number, string>()
+  try {
+    const listed = await api.post<ListPartsResponse>('/upload/list-parts', {
+      s3_key: s3Key,
+      upload_id: uploadId,
+    })
+    for (const p of listed.parts) etagByPart.set(p.part_number, p.etag)
+  } catch {
+    // No resumable state (fresh upload, expired upload, or endpoint hiccup) —
+    // proceed as if nothing was uploaded yet.
+  }
+
+  const pending: number[] = []
+  for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
+    if (!etagByPart.has(partNumber)) pending.push(partNumber)
+  }
+
+  // 2. Batch-presign all pending parts in a single round-trip.
+  const urlByPart = new Map<number, string>()
+  if (pending.length > 0) {
+    const presigned = await api.post<BatchPresignResponse>('/upload/presign-parts', {
+      s3_key: s3Key,
+      upload_id: uploadId,
+      part_numbers: pending,
+    })
+    for (const p of presigned.parts) urlByPart.set(p.part_number, p.url)
+  }
+
+  // 3. Track per-part uploaded bytes for accurate aggregate progress. Seed with
+  //    already-uploaded parts so a resumed upload doesn't start the bar at 0.
+  const bytesForPart = (partNumber: number) =>
+    Math.min(partNumber * CHUNK_SIZE, file.size) - (partNumber - 1) * CHUNK_SIZE
+  const uploadedBytesByPart = new Map<number, number>()
+  Array.from(etagByPart.keys()).forEach((partNumber) => {
+    uploadedBytesByPart.set(partNumber, bytesForPart(partNumber))
+  })
+  const reportProgress = () => {
+    let sum = 0
+    Array.from(uploadedBytesByPart.values()).forEach((b) => {
+      sum += b
+    })
+    onProgress(sum)
+  }
+  reportProgress()
+
+  // 4. Upload one part with retry + exponential backoff.
+  const putPart = async (partNumber: number): Promise<string> => {
+    const start = (partNumber - 1) * CHUNK_SIZE
+    const end = Math.min(start + CHUNK_SIZE, file.size)
+    const chunk = file.slice(start, end)
+    const url = urlByPart.get(partNumber)
+    if (!url) throw new Error(`No presigned URL for part ${partNumber}`)
+
+    let lastErr: unknown
+    for (let attempt = 1; attempt <= PART_MAX_ATTEMPTS; attempt++) {
+      if (signal.aborted) throw new DOMException('Upload cancelled', 'AbortError')
+      try {
+        const res = await fetch(url, { method: 'PUT', body: chunk, signal })
+        if (!res.ok) throw new Error(`Part ${partNumber} failed: ${res.statusText}`)
+        return res.headers.get('ETag') ?? ''
+      } catch (err) {
+        // Cancellation is terminal — never retry an aborted PUT.
+        if (signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+          throw new DOMException('Upload cancelled', 'AbortError')
+        }
+        lastErr = err
+        if (attempt < PART_MAX_ATTEMPTS) {
+          await sleep(PART_RETRY_BASE_MS * 2 ** (attempt - 1))
+        }
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(`Part ${partNumber} failed`)
+  }
+
+  // 5. Bounded-concurrency pool: N workers drain the shared `pending` worklist.
+  let cursor = 0
+  const worker = async () => {
+    while (true) {
+      if (signal.aborted) throw new DOMException('Upload cancelled', 'AbortError')
+      const idx = cursor++
+      if (idx >= pending.length) return
+      const partNumber = pending[idx]
+      const etag = await putPart(partNumber)
+      etagByPart.set(partNumber, etag)
+      uploadedBytesByPart.set(partNumber, bytesForPart(partNumber))
+      reportProgress()
+    }
+  }
+  const workerCount = Math.min(UPLOAD_CONCURRENCY, pending.length) || 1
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+
+  // 6. Assemble the full part list (resumed + uploaded), sorted by part number.
+  const parts: CompletedPart[] = []
+  for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
+    parts.push({ PartNumber: partNumber, ETag: etagByPart.get(partNumber) ?? '' })
+  }
+  return parts
+}
 
 interface UploadStore {
   files: UploadFile[]
@@ -186,39 +335,17 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 
         updateFile(id, { uploadId: upload_id, assetId: asset_id, versionId: version_id, s3Key: s3_key })
 
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
-        const parts: Array<{ PartNumber: number; ETag: string }> = []
-
-        for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
-          if (controller.signal.aborted) {
-            throw new DOMException('Upload cancelled', 'AbortError')
-          }
-
-          const start = (partNumber - 1) * CHUNK_SIZE
-          const end = Math.min(start + CHUNK_SIZE, file.size)
-          const chunk = file.slice(start, end)
-
-          const { presigned_url } = await api.post<{ presigned_url: string }>('/upload/presign-part', {
-            s3_key,
-            upload_id,
-            part_number: partNumber,
-          })
-
-          const putResponse = await fetch(presigned_url, {
-            method: 'PUT',
-            body: chunk,
-            signal: controller.signal,
-          })
-
-          if (!putResponse.ok) {
-            throw new Error(`Part ${partNumber} failed: ${putResponse.statusText}`)
-          }
-
-          const etag = putResponse.headers.get('ETag') ?? ''
-          parts.push({ PartNumber: partNumber, ETag: etag })
-
-          updateFile(id, { progress: Math.round((partNumber / totalChunks) * 95) })
-        }
+        const parts = await uploadParts({
+          file,
+          s3Key: s3_key,
+          uploadId: upload_id,
+          signal: controller.signal,
+          onProgress: (uploadedBytes) => {
+            // Reserve 95–100% for the complete/processing handoff.
+            const pct = file.size > 0 ? Math.round((uploadedBytes / file.size) * 95) : 95
+            updateFile(id, { progress: pct })
+          },
+        })
 
         await api.post('/upload/complete', {
           s3_key,
@@ -300,20 +427,16 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         version_id = initRes.version_id
         updateFile(id, { uploadId: upload_id, versionId: version_id, s3Key: s3_key })
 
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
-        const parts: Array<{ PartNumber: number; ETag: string }> = []
-        for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
-          if (controller.signal.aborted) throw new DOMException('Upload cancelled', 'AbortError')
-          const start = (partNumber - 1) * CHUNK_SIZE
-          const chunk = file.slice(start, Math.min(start + CHUNK_SIZE, file.size))
-          const { presigned_url } = await api.post<{ presigned_url: string }>('/upload/presign-part', {
-            s3_key, upload_id, part_number: partNumber,
-          })
-          const putResponse = await fetch(presigned_url, { method: 'PUT', body: chunk, signal: controller.signal })
-          if (!putResponse.ok) throw new Error(`Part ${partNumber} failed: ${putResponse.statusText}`)
-          parts.push({ PartNumber: partNumber, ETag: putResponse.headers.get('ETag') ?? '' })
-          updateFile(id, { progress: Math.round((partNumber / totalChunks) * 95) })
-        }
+        const parts = await uploadParts({
+          file,
+          s3Key: s3_key,
+          uploadId: upload_id,
+          signal: controller.signal,
+          onProgress: (uploadedBytes) => {
+            const pct = file.size > 0 ? Math.round((uploadedBytes / file.size) * 95) : 95
+            updateFile(id, { progress: pct })
+          },
+        })
 
         await api.post('/upload/complete', { s3_key, upload_id, asset_id: assetId, version_id, parts })
         const isMedia = file.type.startsWith('video/') || file.type.startsWith('audio/') || file.type.startsWith('image/')

@@ -1,5 +1,7 @@
 import redis
 import secrets
+import time
+import threading
 from typing import Optional
 from ..config import settings
 
@@ -108,16 +110,53 @@ def delete_invite_token(token: str) -> None:
 RATE_LIMIT_PREFIX = "rl:"
 
 
+# In-process fallback limiter — used ONLY when Redis is unavailable so that
+# security-sensitive limits (auth, share-password) keep throttling instead of
+# silently disabling protection. It is per-process (not shared across workers)
+# and therefore intentionally conservative: a security limit that loses Redis
+# degrades to a tighter local cap rather than failing open.
+_local_counters: dict = {}
+_local_lock = threading.Lock()
+
+
+def _local_rate_limit(
+    key: str,
+    max_requests: int,
+    window_seconds: int,
+) -> tuple[bool, int]:
+    """Conservative per-process sliding-window fallback. Returns (allowed, retry_after)."""
+    now = time.monotonic()
+    with _local_lock:
+        bucket = _local_counters.get(key)
+        if bucket is None or now >= bucket["reset"]:
+            bucket = {"count": 0, "reset": now + window_seconds}
+            _local_counters[key] = bucket
+        if bucket["count"] >= max_requests:
+            return False, max(int(bucket["reset"] - now), 1)
+        bucket["count"] += 1
+        return True, 0
+
+
 def check_rate_limit(
     ip: str,
     action: str,
     max_requests: int,
     window_seconds: int,
+    *,
+    fail_closed: bool = False,
 ) -> tuple[bool, int]:
     """
     Check if an IP has exceeded the rate limit for a given action.
     Returns (allowed, remaining_seconds_until_reset).
-    Uses a simple counter with TTL in Redis. Fails open if Redis is unavailable.
+    Uses a simple counter with TTL in Redis.
+
+    On Redis error:
+      * fail_closed=False (default, non-security limits): degrade to a
+        conservative in-process limiter so requests are still throttled rather
+        than silently unbounded.
+      * fail_closed=True (auth / share-password contexts): never silently
+        disable protection — fall back to the in-process limiter and, if even
+        that cannot be evaluated, deny the request.
     """
     try:
         r = get_redis()
@@ -134,8 +173,80 @@ def check_rate_limit(
         pipe.execute()
         return True, 0
     except Exception:
-        # Fail open — allow the request if Redis is unavailable
-        return True, 0
+        # Redis is unavailable. NEVER silently disable throttling: degrade to a
+        # conservative in-process limiter. For security limits, deny outright if
+        # the local limiter itself cannot be evaluated.
+        try:
+            return _local_rate_limit(
+                f"{RATE_LIMIT_PREFIX}{action}:{ip}", max_requests, window_seconds
+            )
+        except Exception:
+            if fail_closed:
+                return False, window_seconds
+            return True, 0
+
+
+# ── Per-share-link password brute-force lockout ───────────────────────────────
+#
+# bcrypt cost alone does not stop online brute-force of a share password once
+# per-IP throttling is bypassed. We cap failed attempts per share link in Redis
+# and lock the link out for a cool-down once the cap is hit. Keyed by share link
+# id (the durable identifier), independent of caller IP.
+
+SHARE_PW_ATTEMPTS_PREFIX = "share_pw_attempts:"
+MAX_SHARE_PW_ATTEMPTS = 10
+SHARE_PW_LOCKOUT_SECONDS = 900  # 15 minutes
+
+
+def _share_pw_attempts_key(link_id: str) -> str:
+    return f"{SHARE_PW_ATTEMPTS_PREFIX}{link_id}"
+
+
+def check_share_password_lockout(link_id: str) -> tuple[bool, int]:
+    """Return (locked_out, retry_after_seconds) for a share link's password.
+
+    Fails CLOSED on Redis error: if we cannot read the attempt counter for a
+    password-protected link, we must not silently allow unlimited guessing.
+    """
+    try:
+        r = get_redis()
+        key = _share_pw_attempts_key(link_id)
+        attempts = r.get(key)
+        if attempts is not None and int(attempts) >= MAX_SHARE_PW_ATTEMPTS:
+            ttl = r.ttl(key)
+            return True, max(ttl, 1)
+        return False, 0
+    except Exception:
+        # Cannot verify attempt budget — treat as locked to avoid open brute-force.
+        return True, SHARE_PW_LOCKOUT_SECONDS
+
+
+def register_share_password_failure(link_id: str) -> tuple[bool, int]:
+    """Record a failed share-password attempt; start a lockout once the cap is hit.
+
+    Returns (now_locked_out, retry_after_seconds). Best-effort on Redis error
+    (the read-side check above is the fail-closed gate)."""
+    try:
+        r = get_redis()
+        key = _share_pw_attempts_key(link_id)
+        count = r.incr(key)
+        # (Re)arm the cool-down window on every failure so sustained guessing
+        # keeps the link locked.
+        r.expire(key, SHARE_PW_LOCKOUT_SECONDS)
+        if count >= MAX_SHARE_PW_ATTEMPTS:
+            return True, SHARE_PW_LOCKOUT_SECONDS
+        return False, 0
+    except Exception:
+        return False, 0
+
+
+def reset_share_password_attempts(link_id: str) -> None:
+    """Clear the failed-attempt counter after a successful password verification."""
+    try:
+        r = get_redis()
+        r.delete(_share_pw_attempts_key(link_id))
+    except Exception:
+        pass
 
 
 # ── Share link password sessions ──────────────────────────────────────────────

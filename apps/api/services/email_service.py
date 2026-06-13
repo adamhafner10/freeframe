@@ -222,8 +222,8 @@ class EmailService:
             <h2>You're invited!</h2>
             <p><strong>{inviter_name}</strong> has invited you to join <strong>{org_name}</strong> on FileStream.</p>
             <p>
-                <a href="{invite_link}" 
-                   style="display: inline-block; padding: 12px 24px; background-color: #4F46E5; 
+                <a href="{invite_link}"
+                   style="display: inline-block; padding: 12px 24px; background-color: #4F46E5;
                           color: white; text-decoration: none; border-radius: 6px;">
                     Accept Invitation
                 </a>
@@ -236,6 +236,45 @@ class EmailService:
         """
         text_body = f"{inviter_name} has invited you to join {org_name} on FileStream. Click here to accept: {invite_link}"
         return self.send_email(to_email, subject, html_body, text_body)
+
+    def send_invite_email_sync(
+        self,
+        to_email: str,
+        inviter_name: str,
+        org_name: str,
+        invite_link: str,
+        team_name: Optional[str] = None,
+        expiry_days: int = 7,
+    ) -> bool:
+        """Send the organization/team invite email synchronously, raising on failure.
+
+        Mirrors the synchronous magic-code path: the invite token lives only in
+        this email, there is no resend-on-dispatch, and the API must NOT report
+        success unless the email actually went out. We render the same
+        templates/email/invite.html the Celery task uses (via render_template) so
+        the message stays identical, then send through send_email_sync which
+        propagates transport/provider failures to the caller. Raises on failure;
+        returns True on success.
+        """
+        # Local import to avoid a circular import at module load time
+        # (email_tasks imports email_service).
+        from ..tasks.email_tasks import render_template
+
+        subject = f"You've been invited to join {org_name} on FileStream"
+        html_body = render_template(
+            "email/invite.html",
+            subject=subject,
+            inviter_name=inviter_name,
+            org_name=org_name,
+            team_name=team_name,
+            invite_link=invite_link,
+            expiry_days=expiry_days,
+        )
+        text_body = (
+            f"{inviter_name} has invited you to join {org_name} on FileStream. "
+            f"Accept here: {invite_link}"
+        )
+        return self.send_email_sync(to_email, subject, html_body, text_body)
     
     def send_comment_notification(
         self, 

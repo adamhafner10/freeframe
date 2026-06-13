@@ -106,13 +106,15 @@ class TestValidateShareLinkWithSession:
         assert result == mock_link
         mock_verify_session.assert_called_once_with("token123", "sess-abc")
 
+    @patch("apps.api.services.permissions.check_share_password_lockout")
     @patch("apps.api.services.permissions.verify_share_session")
     @patch("apps.api.services.permissions.validate_share_link")
-    def test_password_link_no_session_raises(self, mock_validate, mock_verify_session):
+    def test_password_link_no_session_raises(self, mock_validate, mock_verify_session, mock_lockout):
         mock_link = MagicMock()
         mock_link.password_hash = "$2b$12$hashvalue"
         mock_link.created_by = None
         mock_validate.return_value = mock_link
+        mock_lockout.return_value = (False, 0)  # not locked out
 
         from apps.api.services.permissions import validate_share_link_with_session
 
@@ -120,14 +122,16 @@ class TestValidateShareLinkWithSession:
             validate_share_link_with_session(MagicMock(), "token123")
         assert exc_info.value.status_code == 403
 
+    @patch("apps.api.services.permissions.check_share_password_lockout")
     @patch("apps.api.services.permissions.verify_share_session")
     @patch("apps.api.services.permissions.validate_share_link")
-    def test_password_link_invalid_session_raises(self, mock_validate, mock_verify_session):
+    def test_password_link_invalid_session_raises(self, mock_validate, mock_verify_session, mock_lockout):
         mock_link = MagicMock()
         mock_link.password_hash = "$2b$12$hashvalue"
         mock_link.created_by = None
         mock_validate.return_value = mock_link
         mock_verify_session.return_value = False
+        mock_lockout.return_value = (False, 0)  # not locked out
 
         from apps.api.services.permissions import validate_share_link_with_session
 
@@ -136,3 +140,43 @@ class TestValidateShareLinkWithSession:
                 MagicMock(), "token123", share_session="bad-session"
             )
         assert exc_info.value.status_code == 403
+
+    @patch("apps.api.services.permissions.check_share_password_lockout")
+    @patch("apps.api.services.permissions.verify_share_session")
+    @patch("apps.api.services.permissions.validate_share_link")
+    def test_password_link_locked_out_raises_429(self, mock_validate, mock_verify_session, mock_lockout):
+        mock_link = MagicMock()
+        mock_link.password_hash = "$2b$12$hashvalue"
+        mock_link.created_by = None
+        mock_validate.return_value = mock_link
+        mock_verify_session.return_value = False
+        mock_lockout.return_value = (True, 900)  # locked out after too many attempts
+
+        from apps.api.services.permissions import validate_share_link_with_session
+
+        with pytest.raises(Exception) as exc_info:
+            validate_share_link_with_session(
+                MagicMock(), "token123", share_session="bad-session"
+            )
+        assert exc_info.value.status_code == 429
+
+    @patch("apps.api.services.permissions.check_share_password_lockout")
+    @patch("apps.api.services.permissions.verify_share_session")
+    @patch("apps.api.services.permissions.validate_share_link")
+    def test_valid_session_skips_lockout_check(self, mock_validate, mock_verify_session, mock_lockout):
+        # A valid password session must bypass the lockout gate (the fast path).
+        mock_link = MagicMock()
+        mock_link.password_hash = "$2b$12$hashvalue"
+        mock_link.created_by = None
+        mock_validate.return_value = mock_link
+        mock_verify_session.return_value = True
+        mock_lockout.return_value = (True, 900)  # would be locked out, but session wins
+
+        from apps.api.services.permissions import validate_share_link_with_session
+
+        result = validate_share_link_with_session(
+            MagicMock(), "token123", share_session="good-session"
+        )
+
+        assert result == mock_link
+        mock_lockout.assert_not_called()
