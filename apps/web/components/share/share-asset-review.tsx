@@ -166,37 +166,88 @@ function GuestIdentityPrompt({
 
 // ─── Approval actions (approve / reject) ──────────────────────────────────────
 
-function GuestApprovalActions({ token, assetId }: { token: string; assetId: string }) {
+function GuestApprovalActions({
+  token,
+  assetId,
+  shareSession,
+}: {
+  token: string
+  assetId: string
+  shareSession?: string | null
+}) {
   const [status, setStatus] = React.useState<'idle' | 'approved' | 'rejected'>('idle')
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  // Identity-capture gate: when a guest with no stored identity clicks a
+  // decision, stash it and show the prompt; replay once they identify.
+  const [showGuestPrompt, setShowGuestPrompt] = React.useState(false)
+  const pendingDecisionRef = React.useRef<'approved' | 'rejected' | null>(null)
 
-  async function decide(decision: 'approved' | 'rejected') {
-    setLoading(true)
-    setError(null)
-    try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  // Submit the decision to the backend. An approval must always be attributable,
+  // so for unauthenticated guests we send the stored guest identity alongside
+  // asset_id (the bearer token is still sent when present).
+  const submitDecision = React.useCallback(
+    async (decision: 'approved' | 'rejected') => {
+      setLoading(true)
+      setError(null)
       try {
-        const t = localStorage.getItem('ff_access_token')
-        if (t) headers['Authorization'] = `Bearer ${t}`
-      } catch {
-        /* ignore */
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+        const loggedIn = isLoggedIn()
+        try {
+          const t = localStorage.getItem('ff_access_token')
+          if (t) headers['Authorization'] = `Bearer ${t}`
+        } catch {
+          /* ignore */
+        }
+        const payload: {
+          asset_id: string
+          guest_email?: string
+          guest_name?: string
+        } = { asset_id: assetId }
+        if (!loggedIn) {
+          const identity = loadGuestIdentity()
+          if (identity) {
+            payload.guest_name = identity.name
+            payload.guest_email = identity.email
+          }
+        }
+        const qs = shareSession ? `?share_session=${encodeURIComponent(shareSession)}` : ''
+        const res = await fetch(
+          `${API_URL}/share/${token}/${decision === 'approved' ? 'approve' : 'reject'}${qs}`,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+          },
+        )
+        if (!res.ok) throw new Error('Failed to submit decision')
+        setStatus(decision)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to submit')
+      } finally {
+        setLoading(false)
       }
-      const res = await fetch(
-        `${API_URL}/share/${token}/${decision === 'approved' ? 'approve' : 'reject'}`,
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ asset_id: assetId }),
-        },
-      )
-      if (!res.ok) throw new Error('Failed to submit decision')
-      setStatus(decision)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to submit')
-    } finally {
-      setLoading(false)
+    },
+    [token, assetId, shareSession],
+  )
+
+  // Capture identity first (same pattern as the comment input) so the decision
+  // is always attributable, then submit.
+  function decide(decision: 'approved' | 'rejected') {
+    if (!isLoggedIn() && !loadGuestIdentity()) {
+      pendingDecisionRef.current = decision
+      setShowGuestPrompt(true)
+      return
     }
+    submitDecision(decision)
+  }
+
+  function handleIdentitySaved(identity: GuestIdentity) {
+    saveGuestIdentity(identity)
+    setShowGuestPrompt(false)
+    const pending = pendingDecisionRef.current
+    pendingDecisionRef.current = null
+    if (pending) setTimeout(() => submitDecision(pending), 50)
   }
 
   if (status === 'approved') {
@@ -217,25 +268,36 @@ function GuestApprovalActions({ token, assetId }: { token: string; assetId: stri
   }
 
   return (
-    <div className="flex items-center gap-2">
-      {error && <span className="text-xs text-red-400 mr-1">{error}</span>}
-      <button
-        onClick={() => decide('rejected')}
-        disabled={loading}
-        className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium border border-red-500/30 text-red-400 hover:border-red-500/60 hover:bg-red-500/10 disabled:opacity-50 transition-colors"
-      >
-        <XCircle className="h-4 w-4" />
-        Reject
-      </button>
-      <button
-        onClick={() => decide('approved')}
-        disabled={loading}
-        className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
-      >
-        {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-        Approve
-      </button>
-    </div>
+    <>
+      <div className="flex items-center gap-2">
+        {error && <span className="text-xs text-red-400 mr-1">{error}</span>}
+        <button
+          onClick={() => decide('rejected')}
+          disabled={loading}
+          className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium border border-red-500/30 text-red-400 hover:border-red-500/60 hover:bg-red-500/10 disabled:opacity-50 transition-colors"
+        >
+          <XCircle className="h-4 w-4" />
+          Reject
+        </button>
+        <button
+          onClick={() => decide('approved')}
+          disabled={loading}
+          className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+        >
+          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+          Approve
+        </button>
+      </div>
+      {showGuestPrompt && (
+        <GuestIdentityPrompt
+          onSave={handleIdentitySaved}
+          onCancel={() => {
+            setShowGuestPrompt(false)
+            pendingDecisionRef.current = null
+          }}
+        />
+      )}
+    </>
   )
 }
 
@@ -306,6 +368,7 @@ function MediaPlaceholder({
 
 interface ShareAssetReviewInnerProps {
   token: string
+  shareSession?: string | null
   permission: SharePermission
   allowDownload: boolean
   branding: ProjectBranding | null
@@ -316,6 +379,7 @@ interface ShareAssetReviewInnerProps {
 
 function ShareAssetReviewInner({
   token,
+  shareSession,
   permission,
   allowDownload,
   branding,
@@ -600,7 +664,7 @@ function ShareAssetReviewInner({
                   {/* Approval actions */}
                   {permission === 'approve' && (
                     <div className="px-4 py-3 border-t border-border shrink-0">
-                      <GuestApprovalActions token={token} assetId={asset.id} />
+                      <GuestApprovalActions token={token} assetId={asset.id} shareSession={shareSession} />
                     </div>
                   )}
 
@@ -720,6 +784,7 @@ export function ShareAssetReview({
     <ReviewProvider assetId={assetId} shareToken={token} shareSession={shareSession}>
       <ShareAssetReviewInner
         token={token}
+        shareSession={shareSession}
         permission={permission}
         allowDownload={allowDownload}
         branding={branding}

@@ -128,6 +128,8 @@ export interface AssetVersion {
   asset_id: string;
   version_number: number;
   processing_status: AssetVersionStatus;
+  /** HLS transcode state, decoupled from raw playability (processing_status). */
+  hls_status?: "pending" | "processing" | "ready" | "failed";
   created_by: string;
   created_at: string;
   deleted_at: string | null;

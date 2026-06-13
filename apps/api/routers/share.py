@@ -16,7 +16,8 @@ from ..models.user import User
 from ..models.asset import Asset
 from ..models.folder import Folder
 from ..models.share import AssetShare, ShareLink, ShareLinkItem, SharePermission, ShareLinkActivity, ShareActivityAction
-from ..models.activity import ActivityLog, ActivityAction
+from ..models.activity import ActivityLog, ActivityAction, Notification, NotificationType
+from ..models.approval import Approval, ApprovalStatus
 from ..models.branding import ProjectBranding, WatermarkSettings, WatermarkContent
 from ..models.asset import AssetVersion, AssetType, MediaFile, ProcessingStatus, HLSStatus
 from ..models.comment import Comment
@@ -34,13 +35,14 @@ from ..schemas.share import (
     ShareLinkUpdate,
     ShareLinkValidateResponse,
 )
-from ..services.permissions import get_project_member, require_project_role, validate_share_link, validate_share_link_with_session
+from ..services.permissions import get_project_member, require_project_role, validate_share_link, validate_share_link_with_session, validate_asset_in_share
 from ..services.redis_service import create_share_session
 from ..services.s3_service import generate_presigned_get_url
 from ..routers.hls_proxy import create_hls_token
 from ..services.crypto_service import encrypt_password, decrypt_password
 from ..models.project import Project, ProjectRole
-from ..tasks.email_tasks import send_share_email
+from ..schemas.approval import GuestApprovalCreate
+from ..tasks.email_tasks import send_share_email, send_approval_email
 from ..tasks.celery_app import send_task_safe
 from ..config import settings
 
@@ -1329,6 +1331,170 @@ def create_multi_share_link(
     db.refresh(link)
     _enqueue_watermark_for_link(db, link)
     return link
+
+
+# ── Guest approve / reject (public share endpoints) ──────────────────────────
+
+def _decide_via_share(
+    token: str,
+    decision: ApprovalStatus,
+    body: GuestApprovalCreate,
+    share_session: Optional[str],
+    db: Session,
+    current_user: Optional[User],
+) -> dict:
+    """Shared implementation for guest/member approve + reject on a share link.
+
+    Mirrors guest_comment's resolution chain: validate the (possibly secure /
+    password-protected) link, require approve permission, scope-check the target
+    asset, resolve the latest ready version, then upsert an Approval record keyed
+    by the authenticated user or, for guests, by guest_email. Writes an
+    ActivityLog (when a member) + a ShareLinkActivity row, and best-effort emails
+    the asset creator like the authenticated approvals router does."""
+    link = validate_share_link_with_session(
+        db, token, share_session=share_session, current_user=current_user
+    )
+
+    # Only links granted approve permission may record decisions.
+    if link.permission != SharePermission.approve:
+        raise HTTPException(status_code=403, detail="This share link does not allow approvals")
+
+    # Resolve asset_id: from body, link, or error — then scope-check it.
+    target_asset_id = body.asset_id or link.asset_id
+    if not target_asset_id:
+        raise HTTPException(status_code=400, detail="asset_id is required for folder/project shares")
+    asset = validate_asset_in_share(db, link, target_asset_id)
+
+    # Resolve version_id: use provided or the latest ready version (mirrors guest_comment).
+    version_id = body.version_id
+    if not version_id:
+        latest = db.query(AssetVersion).filter(
+            AssetVersion.asset_id == asset.id,
+            AssetVersion.deleted_at.is_(None),
+            AssetVersion.processing_status == ProcessingStatus.ready,
+        ).order_by(AssetVersion.version_number.desc()).first()
+        if not latest:
+            raise HTTPException(status_code=400, detail="No ready version found for this asset")
+        version_id = latest.id
+
+    # Determine actor: authenticated member, else guest identity from the body.
+    guest_email: Optional[str] = None
+    guest_name: Optional[str] = None
+    if current_user is None:
+        if not body.guest_email or not body.guest_name:
+            raise HTTPException(
+                status_code=400,
+                detail="guest_email and guest_name required for anonymous approvals",
+            )
+        guest_email = body.guest_email.lower()
+        guest_name = body.guest_name
+
+    # Upsert: one decision per (version, member) or per (version, guest_email).
+    if current_user is not None:
+        existing = db.query(Approval).filter(
+            Approval.asset_id == asset.id,
+            Approval.version_id == version_id,
+            Approval.user_id == current_user.id,
+            Approval.deleted_at.is_(None),
+        ).first()
+    else:
+        existing = db.query(Approval).filter(
+            Approval.asset_id == asset.id,
+            Approval.version_id == version_id,
+            Approval.guest_email == guest_email,
+            Approval.deleted_at.is_(None),
+        ).first()
+
+    if existing:
+        existing.status = decision
+        existing.note = body.note
+        if current_user is None:
+            existing.guest_name = guest_name
+        approval = existing
+    else:
+        approval = Approval(
+            asset_id=asset.id,
+            version_id=version_id,
+            user_id=current_user.id if current_user else None,
+            guest_email=guest_email,
+            guest_name=guest_name,
+            status=decision,
+            note=body.note,
+        )
+        db.add(approval)
+
+    # ActivityLog requires a user_id (NOT NULL FK) — only write it for members.
+    if current_user is not None:
+        db.add(ActivityLog(
+            user_id=current_user.id,
+            asset_id=asset.id,
+            action=ActivityAction.approved if decision == ApprovalStatus.approved else ActivityAction.rejected,
+        ))
+        if asset.created_by and asset.created_by != current_user.id:
+            db.add(Notification(user_id=asset.created_by, type=NotificationType.approval, asset_id=asset.id))
+
+    db.commit()
+    db.refresh(approval)
+
+    # Share link activity (attributed to member or guest).
+    actor_email = current_user.email if current_user else (guest_email or "anonymous")
+    actor_name = current_user.name if current_user else guest_name
+    _log_share_activity(
+        db, link.id,
+        ShareActivityAction.approved if decision == ApprovalStatus.approved else ShareActivityAction.rejected,
+        actor_email=actor_email,
+        actor_name=actor_name,
+        asset_id=asset.id,
+        asset_name=asset.name,
+    )
+
+    # Best-effort: notify the asset creator by email (matches approvals.py).
+    if asset.created_by and (current_user is None or asset.created_by != current_user.id):
+        creator = db.query(User).filter(User.id == asset.created_by).first()
+        if creator:
+            asset_link = f"{settings.frontend_url}/assets/{asset.id}"
+            send_task_safe(
+                send_approval_email,
+                to_email=creator.email,
+                reviewer_name=actor_name or actor_email,
+                asset_name=asset.name,
+                status="approved" if decision == ApprovalStatus.approved else "rejected",
+                asset_link=asset_link,
+                note=body.note,
+            )
+
+    return {
+        "status": approval.status.value if hasattr(approval.status, "value") else str(approval.status),
+        "asset_id": str(asset.id),
+        "version_id": str(version_id),
+    }
+
+
+@router.post("/share/{token}/approve", status_code=status.HTTP_200_OK)
+def share_approve(
+    token: str,
+    body: GuestApprovalCreate,
+    share_session: Optional[str] = Query(None, alias="share_session"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Public endpoint — optional auth. Record an approval on a share link
+    (permission must be 'approve'). Works for guests (guest_email/guest_name) or
+    authenticated members (recorded against their user_id)."""
+    return _decide_via_share(token, ApprovalStatus.approved, body, share_session, db, current_user)
+
+
+@router.post("/share/{token}/reject", status_code=status.HTTP_200_OK)
+def share_reject(
+    token: str,
+    body: GuestApprovalCreate,
+    share_session: Optional[str] = Query(None, alias="share_session"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Public endpoint — optional auth. Record a rejection on a share link
+    (permission must be 'approve'). Works for guests or authenticated members."""
+    return _decide_via_share(token, ApprovalStatus.rejected, body, share_session, db, current_user)
 
 
 # ── Folder share public endpoints ─────────────────────────────────────────────

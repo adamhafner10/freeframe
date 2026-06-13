@@ -2,10 +2,17 @@
 
 import * as React from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
-import { Film, Music, Image as ImageIcon, Images, MessageSquare, MoreHorizontal, Check, Share2, Download, Link as LinkIcon, Pencil, Trash2 } from 'lucide-react'
+import { Film, Music, Image as ImageIcon, Images, MessageSquare, MoreHorizontal, Check, Share2, Download, Link as LinkIcon, Pencil, Trash2, Loader2, AlertTriangle, RotateCcw } from 'lucide-react'
 import { cn, formatRelativeTime, formatBytes } from '@/lib/utils'
-import type { Asset, AssetType, User } from '@/types'
+import type { Asset, AssetType, AssetVersionStatus, User } from '@/types'
 import type { AspectRatio, ThumbnailScale, TitleLines } from '@/stores/view-store'
+
+/**
+ * Transcode (HLS) status surfaced from the backend's AssetVersionResponse.
+ * Defined locally because `hls_status` is being threaded through the API
+ * response shape; see types/index.ts (AssetVersion) for the canonical home.
+ */
+export type HlsStatus = 'pending' | 'processing' | 'ready' | 'failed'
 
 const assetTypeIcons: Record<AssetType, React.ElementType> = {
   video: Film,
@@ -37,6 +44,13 @@ interface AssetCardProps {
   onRename?: () => void
   onDelete?: () => void
   fileSize?: number | null
+  // Transcode state (from latest version's AssetVersionResponse)
+  hlsStatus?: HlsStatus | null
+  processingStatus?: AssetVersionStatus | null
+  /** Show the Retry control when transcode failed (gated to editor+ by the caller) */
+  canRetry?: boolean
+  /** Re-enqueue the failed/missing HLS transcode for the latest version */
+  onRetryTranscode?: () => Promise<void> | void
   // Appearance settings
   showInfo?: boolean
   showFileSize?: boolean
@@ -75,6 +89,10 @@ export function AssetCard({
   onRename,
   onDelete,
   fileSize,
+  hlsStatus,
+  processingStatus,
+  canRetry = false,
+  onRetryTranscode,
   showInfo = true,
   showFileSize = true,
   showUploader = true,
@@ -86,6 +104,30 @@ export function AssetCard({
   const TypeIcon = assetTypeIcons[asset.asset_type]
   const lineClamp = titleLines === '1' ? 'line-clamp-1' : titleLines === '2' ? 'line-clamp-2' : 'line-clamp-3'
   const [imgError, setImgError] = React.useState(false)
+  const [retrying, setRetrying] = React.useState(false)
+
+  // Derive a single transcode badge state from processing + HLS status.
+  // Uploading (still ingesting) → Processing (transcoding) → Ready → Failed.
+  const transcodeState: 'uploading' | 'processing' | 'failed' | 'ready' | null = (() => {
+    if (processingStatus === 'uploading') return 'uploading'
+    if (hlsStatus === 'failed' || processingStatus === 'failed') return 'failed'
+    if (hlsStatus === 'pending' || hlsStatus === 'processing' || processingStatus === 'processing') return 'processing'
+    if (hlsStatus === 'ready') return 'ready'
+    return null
+  })()
+
+  const showRetry = transcodeState === 'failed' && canRetry && !!onRetryTranscode
+
+  const handleRetry = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!onRetryTranscode || retrying) return
+    setRetrying(true)
+    try {
+      await onRetryTranscode()
+    } finally {
+      setRetrying(false)
+    }
+  }
 
   return (
     <div
@@ -137,6 +179,41 @@ export function AssetCard({
           >
             <Check className="h-3.5 w-3.5" />
           </button>
+        )}
+
+        {/* Transcode status badge — top-right. Subtle; 'ready' shows nothing. */}
+        {transcodeState && transcodeState !== 'ready' && (
+          <div className="absolute top-2 right-2 flex items-center gap-1.5">
+            {transcodeState === 'uploading' && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-black/60 px-1.5 py-0.5 text-2xs font-medium text-white backdrop-blur-sm">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                Uploading
+              </span>
+            )}
+            {transcodeState === 'processing' && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-status-warning/20 px-1.5 py-0.5 text-2xs font-medium text-status-warning backdrop-blur-sm">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                Processing
+              </span>
+            )}
+            {transcodeState === 'failed' && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-status-error/20 px-1.5 py-0.5 text-2xs font-medium text-status-error backdrop-blur-sm">
+                <AlertTriangle className="h-3 w-3" />
+                Failed
+              </span>
+            )}
+            {showRetry && (
+              <button
+                onClick={handleRetry}
+                disabled={retrying}
+                title="Retry transcode"
+                className="inline-flex items-center gap-1 rounded-full bg-black/60 px-1.5 py-0.5 text-2xs font-medium text-white backdrop-blur-sm hover:bg-black/80 transition-colors disabled:opacity-60"
+              >
+                {retrying ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                Retry
+              </button>
+            )}
+          </div>
         )}
 
         {/* Duration badge — bottom-right (for video/audio) */}
