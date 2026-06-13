@@ -36,7 +36,12 @@ from ..schemas.share import (
     ShareLinkValidateResponse,
 )
 from ..services.permissions import get_project_member, require_project_role, validate_share_link, validate_share_link_with_session, validate_asset_in_share
-from ..services.redis_service import create_share_session
+from ..services.redis_service import (
+    create_share_session,
+    check_share_password_lockout,
+    register_share_password_failure,
+    reset_share_password_attempts,
+)
 from ..services.s3_service import generate_presigned_get_url
 from ..routers.hls_proxy import create_hls_token
 from ..services.crypto_service import encrypt_password, decrypt_password
@@ -52,6 +57,30 @@ router = APIRouter(tags=["sharing"])
 def _escape_like(s: str) -> str:
     """Escape special LIKE pattern characters to prevent injection."""
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# Raw/processed master URLs served for inline VIEWING (not download) get a short
+# TTL and an inline content-disposition so the browser plays them in place rather
+# than handing the viewer a saveable full-res file.
+_INLINE_STREAM_TTL_SECONDS = 1800
+
+
+def _presigned_inline_stream_url(s3_key: str, expires_in: int = _INLINE_STREAM_TTL_SECONDS) -> str:
+    """Presign a GET that the browser plays inline (Content-Disposition: inline),
+    with a short TTL. Used for the raw/processed master fallback so a no-download
+    share never hands out a long-lived, saveable full-res URL."""
+    from ..services.s3_service import _get_presign_client
+
+    s3 = _get_presign_client()
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": settings.s3_bucket,
+            "Key": s3_key,
+            "ResponseContentDisposition": "inline",
+        },
+        ExpiresIn=expires_in,
+    )
 
 
 def _get_asset(db: Session, asset_id: uuid.UUID) -> Asset:
@@ -166,6 +195,76 @@ def _get_latest_media_file(db: Session, asset_id: uuid.UUID) -> Optional[MediaFi
     if not version:
         return None
     return db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+
+
+def _bulk_latest_media_files(db: Session, asset_ids: list[uuid.UUID]) -> dict:
+    """Map asset_id -> first MediaFile of its latest *ready* version, in bulk.
+
+    Mirrors _get_latest_media_file's semantics (latest ready version, first media
+    file) but resolves the whole page in 2 queries instead of ~2 per asset. Used
+    to kill the N+1 on the folder/project share asset listing that external
+    reviewers hit."""
+    if not asset_ids:
+        return {}
+
+    # Latest READY version number per asset.
+    latest_ready_subq = (
+        db.query(
+            AssetVersion.asset_id.label("asset_id"),
+            sa_func.max(AssetVersion.version_number).label("max_version"),
+        )
+        .filter(
+            AssetVersion.asset_id.in_(asset_ids),
+            AssetVersion.deleted_at.is_(None),
+            AssetVersion.processing_status == ProcessingStatus.ready,
+        )
+        .group_by(AssetVersion.asset_id)
+        .subquery()
+    )
+    latest_versions = (
+        db.query(AssetVersion)
+        .join(
+            latest_ready_subq,
+            (AssetVersion.asset_id == latest_ready_subq.c.asset_id)
+            & (AssetVersion.version_number == latest_ready_subq.c.max_version),
+        )
+        .all()
+    )
+    version_to_asset = {v.id: v.asset_id for v in latest_versions}
+    version_ids = list(version_to_asset.keys())
+    if not version_ids:
+        return {}
+
+    all_files = db.query(MediaFile).filter(MediaFile.version_id.in_(version_ids)).all()
+    # First media file per version (preserve query order, matching .first()).
+    media_by_asset: dict = {}
+    for f in all_files:
+        asset_id = version_to_asset.get(f.version_id)
+        if asset_id is not None and asset_id not in media_by_asset:
+            media_by_asset[asset_id] = f
+    return media_by_asset
+
+
+def _bulk_comment_counts(db: Session, asset_ids: list[uuid.UUID]) -> dict:
+    """Map asset_id -> active comment count, in one grouped query."""
+    if not asset_ids:
+        return {}
+    rows = (
+        db.query(Comment.asset_id, sa_func.count(Comment.id))
+        .filter(Comment.asset_id.in_(asset_ids), Comment.deleted_at.is_(None))
+        .group_by(Comment.asset_id)
+        .all()
+    )
+    return {asset_id: count for asset_id, count in rows}
+
+
+def _bulk_creator_names(db: Session, creator_ids: list[uuid.UUID]) -> dict:
+    """Map user_id -> name for a set of asset creators, in one query."""
+    ids = [cid for cid in creator_ids if cid]
+    if not ids:
+        return {}
+    rows = db.query(User.id, User.name).filter(User.id.in_(ids)).all()
+    return {uid: name for uid, name in rows}
 
 
 def _hls_is_ready(db: Session, media_file: Optional[MediaFile]) -> bool:
@@ -384,14 +483,29 @@ def validate_share_link_endpoint(
                 title=link.title,
                 permission=link.permission,
             )
+        # Per-share-link brute-force lockout (independent of IP). Block before
+        # spending a bcrypt check once too many wrong passwords have been tried.
+        locked_out, retry_after = check_share_password_lockout(str(link.id))
+        if locked_out:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many incorrect password attempts. Try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        bad_password = False
         try:
             plain_bytes = password[:72].encode('utf-8')
             hashed_bytes = link.password_hash.encode('utf-8')
             if not bcrypt.checkpw(plain_bytes, hashed_bytes):
-                raise HTTPException(status_code=403, detail="Incorrect password")
+                bad_password = True
         except ValueError:
+            bad_password = True
+        if bad_password:
+            register_share_password_failure(str(link.id))
             raise HTTPException(status_code=403, detail="Incorrect password")
-        # Password verified — create a session so subsequent requests skip re-verification
+        # Password verified — reset the failure counter and create a session so
+        # subsequent requests skip re-verification.
+        reset_share_password_attempts(str(link.id))
         session_id = secrets.token_urlsafe(32)
         create_share_session(token, session_id)
 
@@ -427,14 +541,25 @@ def validate_share_link_endpoint(
             if wm_url:
                 stream_url = wm_url
             elif is_video and _hls_is_ready(db, media_file):
-                token = create_hls_token(media_file.s3_key_processed)
+                token = create_hls_token(
+                    media_file.s3_key_processed,
+                    share_link_id=link.id,
+                    user_id=current_user.id if current_user else None,
+                )
                 stream_url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={token}"
+            elif is_video and not link.allow_download:
+                # HLS isn't ready AND downloads are disabled: do NOT hand out a
+                # presigned GET to the full-res raw/processed master — that would
+                # leak a saveable full-quality file from a no-download share. Leave
+                # stream_url None; the viewer shows the hls_status processing state.
+                stream_url = None
             elif media_file.s3_key_raw:
-                # Raw mp4 is playable inline while HLS is pending/failed — keeps a
-                # transcode hiccup from bricking playback.
-                stream_url = generate_presigned_get_url(media_file.s3_key_raw)
+                # Download-enabled (or non-video) share: raw mp4 stays playable
+                # inline while HLS is pending/failed so a transcode hiccup never
+                # bricks playback. Short TTL + inline disposition.
+                stream_url = _presigned_inline_stream_url(media_file.s3_key_raw)
             elif media_file.s3_key_processed:
-                stream_url = generate_presigned_get_url(media_file.s3_key_processed)
+                stream_url = _presigned_inline_stream_url(media_file.s3_key_processed)
 
         # Surface HLS transcode status so the share viewer can show a
         # "Processing…" state instead of a broken player when video isn't
@@ -1503,8 +1628,8 @@ def share_reject(
 def get_folder_share_assets(
     token: str,
     folder_id: Optional[uuid.UUID] = None,
-    page: int = 1,
-    per_page: int = 50,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=100),
     share_session: Optional[str] = Query(None, alias="share_session"),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
@@ -1533,6 +1658,17 @@ def get_folder_share_assets(
                 Folder.id.in_(multi_folder_ids),
                 Folder.deleted_at.is_(None),
             ).order_by(Folder.name).all()
+            # Pre-collect up to 4 preview assets per folder, then bulk-resolve
+            # their thumbnails in one media-file lookup (no per-asset N+1).
+            preview_assets_by_sf: dict = {}
+            all_preview_ids: list[uuid.UUID] = []
+            for sf in shared_folders:
+                pa_list = db.query(Asset).filter(
+                    Asset.folder_id == sf.id, Asset.deleted_at.is_(None),
+                ).order_by(Asset.created_at.desc()).limit(4).all()
+                preview_assets_by_sf[sf.id] = pa_list
+                all_preview_ids.extend(pa.id for pa in pa_list)
+            preview_media = _bulk_latest_media_files(db, all_preview_ids)
             for sf in shared_folders:
                 asset_count = db.query(sa_func.count(Asset.id)).filter(
                     Asset.folder_id == sf.id, Asset.deleted_at.is_(None),
@@ -1541,18 +1677,16 @@ def get_folder_share_assets(
                     Folder.parent_id == sf.id, Folder.deleted_at.is_(None),
                 ).scalar() or 0
                 thumb_urls: list[str] = []
-                preview_assets = db.query(Asset).filter(
-                    Asset.folder_id == sf.id, Asset.deleted_at.is_(None),
-                ).order_by(Asset.created_at.desc()).limit(4).all()
-                for pa in preview_assets:
-                    mf = _get_latest_media_file(db, pa.id)
+                for pa in preview_assets_by_sf.get(sf.id, []):
+                    mf = preview_media.get(pa.id)
                     if mf and mf.s3_key_thumbnail:
                         thumb_urls.append(generate_presigned_get_url(mf.s3_key_thumbnail))
                 subfolder_items.append(FolderShareSubfolder(
                     id=sf.id, name=sf.name, item_count=asset_count + child_folder_count, thumbnail_urls=thumb_urls,
                 ))
 
-        # Get shared assets
+        # Get shared assets (batch-loaded: media files + comment counts resolved
+        # for the whole page in 2 grouped queries instead of ~2 per asset).
         asset_items = []
         if multi_asset_ids:
             total = len(multi_asset_ids)
@@ -1560,12 +1694,13 @@ def get_folder_share_assets(
             shared_assets = db.query(Asset).filter(
                 Asset.id.in_(multi_asset_ids), Asset.deleted_at.is_(None),
             ).order_by(Asset.created_at.desc()).offset(offset).limit(per_page).all()
+            page_ids = [a.id for a in shared_assets]
+            media_by_asset = _bulk_latest_media_files(db, page_ids)
+            comment_counts = _bulk_comment_counts(db, page_ids)
             for a in shared_assets:
-                mf = _get_latest_media_file(db, a.id)
+                mf = media_by_asset.get(a.id)
                 thumbnail_url = generate_presigned_get_url(mf.s3_key_thumbnail) if mf and mf.s3_key_thumbnail else None
-                comment_count = db.query(sa_func.count(Comment.id)).filter(
-                    Comment.asset_id == a.id, Comment.deleted_at.is_(None),
-                ).scalar() or 0
+                comment_count = comment_counts.get(a.id, 0)
                 asset_items.append(FolderShareAssetItem(
                     id=a.id, name=a.name, asset_type=a.asset_type.value if hasattr(a.asset_type, 'value') else str(a.asset_type),
                     thumbnail_url=thumbnail_url, created_at=a.created_at.isoformat() if a.created_at else "",
@@ -1605,6 +1740,19 @@ def get_folder_share_assets(
         Folder.deleted_at.is_(None),
     ).order_by(Folder.name).all()
 
+    # Pre-collect up to 4 preview assets per subfolder, then bulk-resolve their
+    # thumbnails in one media-file lookup instead of one per preview asset.
+    preview_assets_by_sf: dict = {}
+    all_preview_ids: list[uuid.UUID] = []
+    for sf in subfolders_query:
+        pa_list = db.query(Asset).filter(
+            Asset.folder_id == sf.id,
+            Asset.deleted_at.is_(None),
+        ).order_by(Asset.created_at.desc()).limit(4).all()
+        preview_assets_by_sf[sf.id] = pa_list
+        all_preview_ids.extend(pa.id for pa in pa_list)
+    preview_media = _bulk_latest_media_files(db, all_preview_ids)
+
     subfolder_items = []
     for sf in subfolders_query:
         # Count assets + direct child folders in this subfolder
@@ -1617,14 +1765,10 @@ def get_folder_share_assets(
             Folder.deleted_at.is_(None),
         ).scalar() or 0
 
-        # Fetch up to 4 thumbnail previews from assets inside this subfolder
+        # Up to 4 thumbnail previews from assets inside this subfolder
         thumb_urls: list[str] = []
-        preview_assets = db.query(Asset).filter(
-            Asset.folder_id == sf.id,
-            Asset.deleted_at.is_(None),
-        ).order_by(Asset.created_at.desc()).limit(4).all()
-        for pa in preview_assets:
-            mf = _get_latest_media_file(db, pa.id)
+        for pa in preview_assets_by_sf.get(sf.id, []):
+            mf = preview_media.get(pa.id)
             if mf and mf.s3_key_thumbnail:
                 thumb_urls.append(generate_presigned_get_url(mf.s3_key_thumbnail))
             if len(thumb_urls) >= 4:
@@ -1657,25 +1801,29 @@ def get_folder_share_assets(
         Asset.deleted_at.is_(None),
     ).order_by(Asset.created_at.desc()).offset(offset).limit(per_page).all()
 
+    # Batch-load media files, comment counts, and creator names for the whole
+    # page (3 grouped queries) instead of ~4 serial queries per asset.
+    page_ids = [a.id for a in assets]
+    media_by_asset = _bulk_latest_media_files(db, page_ids)
+    comment_counts = _bulk_comment_counts(db, page_ids)
+    creator_names = _bulk_creator_names(db, [a.created_by for a in assets])
+
     asset_items = []
     for asset in assets:
         thumbnail_url = None
         file_size = None
         duration_seconds = None
-        media_file = _get_latest_media_file(db, asset.id)
+        media_file = media_by_asset.get(asset.id)
         if media_file:
             if media_file.s3_key_thumbnail:
                 thumbnail_url = generate_presigned_get_url(media_file.s3_key_thumbnail)
             file_size = media_file.file_size_bytes
             duration_seconds = media_file.duration_seconds
 
-        comment_count = db.query(sa_func.count(Comment.id)).filter(
-            Comment.asset_id == asset.id,
-            Comment.deleted_at.is_(None),
-        ).scalar() or 0
+        comment_count = comment_counts.get(asset.id, 0)
 
-        # Get creator name
-        creator = db.query(User).filter(User.id == asset.created_by).first() if asset.created_by else None
+        # Creator name (resolved from the bulk map).
+        creator_name = creator_names.get(asset.created_by) if asset.created_by else None
 
         asset_items.append(FolderShareAssetItem(
             id=asset.id,
@@ -1685,7 +1833,7 @@ def get_folder_share_assets(
             file_size=file_size,
             duration_seconds=duration_seconds,
             comment_count=comment_count,
-            created_by_name=creator.name if creator else None,
+            created_by_name=creator_name,
             created_at=asset.created_at,
         ))
 
@@ -1727,19 +1875,55 @@ def get_share_stream_url(
         if not wm_url:
             _enqueue_watermark(db, asset.id, asset.project_id)
 
+    # Surface HLS transcode status so the viewer can show a "Processing…" state
+    # instead of a broken player (and so we can signal when we intentionally
+    # withhold the raw master on a no-download share).
+    hls_status_value = None
+    if media_file and media_file.version_id:
+        version = db.query(AssetVersion).filter(
+            AssetVersion.id == media_file.version_id
+        ).first()
+        if version and version.hls_status is not None:
+            hls_status_value = (
+                version.hls_status.value
+                if hasattr(version.hls_status, "value")
+                else str(version.hls_status)
+            )
+
     # Playback URL: HLS goes through the proxy so variant + segment URLs stay
     # signed; video w/o HLS yet serves the original file directly.
     if wm_url:
         url = wm_url
     elif asset.asset_type == AssetType.video:
         if _hls_is_ready(db, media_file):
-            hls_token = create_hls_token(media_file.s3_key_processed)
+            hls_token = create_hls_token(
+                media_file.s3_key_processed,
+                share_link_id=link.id,
+                user_id=current_user.id if current_user else None,
+            )
             url = f"{settings.frontend_url.rstrip('/')}/api/stream/hls/master.m3u8?token={hls_token}"
+        elif not link.allow_download:
+            # HLS isn't ready AND downloads are disabled. Serving a presigned GET
+            # to the raw/processed master here would leak a saveable full-res file
+            # from a no-download share. Withhold the URL and signal processing/
+            # unavailable instead (the viewer renders the hls_status state).
+            return {
+                "url": None,
+                "asset_type": asset.asset_type.value,
+                "name": asset.name,
+                "version_id": str(media_file.version_id) if media_file.version_id else None,
+                "thumbnail_url": (
+                    generate_presigned_get_url(media_file.s3_key_thumbnail)
+                    if media_file.s3_key_thumbnail else None
+                ),
+                "duration_seconds": media_file.duration_seconds,
+                "hls_status": hls_status_value,
+            }
         elif media_file.s3_key_raw:
-            # HLS pending/failed: serve the raw mp4 for inline playback so a
-            # transcode hiccup never bricks viewing. This is viewing, not a
-            # download, so it is intentionally not gated on allow_download.
-            url = generate_presigned_get_url(media_file.s3_key_raw)
+            # Download-enabled share, HLS pending/failed: serve the raw mp4 for
+            # inline playback so a transcode hiccup never bricks viewing. Short
+            # TTL + inline disposition.
+            url = _presigned_inline_stream_url(media_file.s3_key_raw)
         else:
             raise HTTPException(status_code=404, detail="No playable media found")
     else:
@@ -1771,6 +1955,7 @@ def get_share_stream_url(
         "version_id": str(media_file.version_id) if media_file.version_id else None,
         "thumbnail_url": thumb_url,
         "duration_seconds": media_file.duration_seconds,
+        "hls_status": hls_status_value,
     }
 
 

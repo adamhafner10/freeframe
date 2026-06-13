@@ -6,7 +6,7 @@ from ..models.project import Project, ProjectMember, ProjectRole
 from ..models.asset import Asset
 from ..models.folder import Folder
 from ..models.share import AssetShare, ShareLink, ShareLinkItem, SharePermission
-from ..services.redis_service import verify_share_session
+from ..services.redis_service import verify_share_session, check_share_password_lockout
 
 
 # ── Project-level ──────────────────────────────────────────────────────────────
@@ -151,11 +151,26 @@ def validate_share_link_with_session(
         # Skip password for authenticated link creator (e.g. admin settings preview)
         if current_user and link.created_by == current_user.id:
             return link
-        if not share_session or not verify_share_session(token, share_session):
+        # Fast path: a valid password session bypasses the lockout gate. The
+        # lockout only matters when no session exists (i.e. someone is still
+        # trying to get past the password — the brute-force surface).
+        if share_session and verify_share_session(token, share_session):
+            return link
+        # Per-share-link brute-force lockout: once too many wrong-password
+        # attempts have accumulated (counted in share.py's bcrypt path), reject
+        # with 429 before any further guessing — independent of caller IP, so it
+        # holds even when per-IP throttling is bypassed.
+        locked_out, retry_after = check_share_password_lockout(str(link.id))
+        if locked_out:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Password required",
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many password attempts. Please try again later.",
+                headers={"Retry-After": str(retry_after)},
             )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password required",
+        )
     return link
 
 

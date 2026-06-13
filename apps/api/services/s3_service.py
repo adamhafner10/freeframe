@@ -1,4 +1,5 @@
 import boto3
+from functools import lru_cache
 from botocore.exceptions import ClientError
 from ..config import settings
 
@@ -18,11 +19,18 @@ def _is_aws_s3() -> bool:
     """Check if using AWS S3 (vs MinIO/local). Controlled by S3_STORAGE env var."""
     return settings.s3_storage.lower() == "s3"
 
+@lru_cache(maxsize=1)
 def get_s3_client():
     """
     Create S3 client. Auto-detects AWS vs MinIO:
     - If access_key starts with 'AKIA' -> use AWS S3 (no endpoint_url)
     - Otherwise -> use custom endpoint (MinIO or S3-compatible)
+
+    Memoized: boto3 clients are thread-safe for service calls, and building one
+    costs ~3ms — a real tax on the hot presign path. lru_cache (itself
+    thread-safe) returns a single shared client for the process lifetime.
+    Credentials/region are read from settings at first call and don't change at
+    runtime, so a process-lifetime singleton is correct here.
     """
     if _is_aws_s3():
         # Real AWS S3 - don't pass endpoint_url
@@ -42,11 +50,16 @@ def get_s3_client():
             region_name=settings.s3_region,
         )
 
+@lru_cache(maxsize=1)
 def _get_presign_client():
     """
     Client for generating presigned URLs. Uses s3_public_endpoint if set,
     so presigned URLs are accessible from the browser (e.g. localhost:9000
     instead of minio:9000 in Docker).
+
+    Memoized for the same reason as get_s3_client(): presigning is the hottest
+    server-side path during a multipart upload (one call per part), so we build
+    the client once and reuse it.
     """
     endpoint = settings.s3_public_endpoint or (None if _is_aws_s3() else settings.s3_endpoint)
     kwargs = {
@@ -137,6 +150,38 @@ def presign_upload_part(s3_key: str, upload_id: str, part_number: int, expires_i
         },
         ExpiresIn=expires_in,
     )
+
+def list_multipart_parts(s3_key: str, upload_id: str) -> list[dict]:
+    """List parts already uploaded for an in-progress multipart upload.
+
+    Returns a list of {"PartNumber": int, "ETag": str} for every part B2/S3 has
+    received. Used to RESUME an interrupted upload: the client skips parts that
+    already landed instead of re-PUTting gigabytes. Paginated (ListParts caps at
+    1000 parts per page). Returns [] if the upload no longer exists.
+    """
+    s3 = get_s3_client()
+    parts: list[dict] = []
+    marker = 0
+    while True:
+        try:
+            resp = s3.list_parts(
+                Bucket=settings.s3_bucket,
+                Key=s3_key,
+                UploadId=upload_id,
+                PartNumberMarker=marker,
+            )
+        except ClientError as e:
+            # NoSuchUpload (expired/aborted) — nothing to resume.
+            if e.response["Error"]["Code"] in ("NoSuchUpload", "404"):
+                return []
+            raise
+        for p in resp.get("Parts", []):
+            parts.append({"PartNumber": p["PartNumber"], "ETag": p["ETag"]})
+        if resp.get("IsTruncated"):
+            marker = resp["NextPartNumberMarker"]
+        else:
+            break
+    return parts
 
 def complete_multipart_upload(s3_key: str, upload_id: str, parts: list[dict]) -> None:
     """Complete a multipart upload. `parts` is a list of {"PartNumber": int, "ETag": str}."""
